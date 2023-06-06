@@ -83,16 +83,18 @@ For further usage, also take a look at the included `EXAMPLES.md` file
 To adjust the image acquisition process of the camera, access to settings like the exposure time are
 necessary. The `vmbsrc` element provides access to these camera features two ways.
 1. If given, an XML file defining camera features and their corresponding values is parsed and all
-   features contained are applied to the camera (see [Using an XML file](####Using-an-XML-file))
+   features contained are applied to the camera except for the pixel format used to record images
+   (see [Using an XML file](####Using-an-XML-file))
 2. Otherwise selected camera features can be set via properties of the `vmbsrc` element (see
    [Supported via GStreamer properties](####Supported-via-GStreamer-properties))
 
-The first approach allows the user to freely modify all features the used camera supports. The
-second one only gives access to a small selection of camera features that are supported by many, but
-not all camera models. The feature names (and in case of enum features their values) follow the
-Standard Feature Naming Convention (SFNC) for GenICam devices. For cameras not implementing the
-SFNC, this may lead to errors in setting some camera features. For these devices the feature setting
-via a provided XML file is recommended.
+The first approach allows the user to freely modify all features the used camera supports (except
+the used pixel format, see [Supported pixel formats](###Supported-pixel-formats) on how to control
+this). The second one only gives access to a small selection of camera features that are supported
+by many, but not all camera models. The feature names (and in case of enum features their values)
+follow the Standard Feature Naming Convention (SFNC) for GenICam devices. For cameras not
+implementing the SFNC, this may lead to errors in setting some camera features. For these devices
+the feature setting via a provided XML file is recommended.
 
 #### Using an XML file
 Providing an XML file containing the desired feature values allows access to all supported camera
@@ -104,16 +106,20 @@ shown below
 gst-launch-1.0 vmbsrc camera=DEV_1AB22D01BBB8 settingsfile=path_to_settings.xml ! videoscale ! videoconvert ! queue ! autovideosink
 ```
 
-**If a settings file is used no other parameters passed as element properties are applied as feature
-values.** This is done to prevent accidental overwriting of previously set features. One exception
-from this rule is the format of the recorded image data. For details on this particular feature see
-[Supported pixel formats](###Supported-pixel-formats).
+> **Warning**  
+> **If a settings file is used no other parameters passed as element properties are applied as
+> feature values.** This is done to prevent accidental overwriting of previously set features. One
+> exception from this rule is the pixel format of the recorded image data. For details on this
+> particular feature see [Supported pixel formats](###Supported-pixel-formats).
 
 #### Supported via GStreamer properties
 A list of supported camera features can be found by using the `gst-inspect` tool on the `vmbsrc`
 element. This displays a list of available "Element Properties", which include the available camera
-features. **Note that these properties are only applied to their corresponding feature, if no XML
-settings file is passed!**
+features.
+
+> **WARNING**  
+> Note that these properties are only applied to their corresponding feature, if no XML settings
+> file is passed!
 
 For some of the exposed features camera specific restrictions in the allowed values may apply. For
 example the `Width`, `Height`, `OffsetX` and `OffsetY` features may only accept integer values
@@ -201,6 +207,10 @@ is able to debayer the data into a widely accepted RGBA format.
   - Not all cameras support access to their features via the names agreed upon in the Standard
     Feature Naming Convention. If your camera uses different names for its features, consider [using
     an XML file to pass camera settings](####Using-an-XML-file) instead.
+- The pixel format is not what I expected
+  - The pixel format is negotiated during pipeline initialization depending on what the element
+    after `vmbsrc` requests. To control which pixel formats are allowed a capsfilter element can be
+    used. See [Supported pixel formats](###Supported-pixel-formats) for an example how to use this.
 - When displaying my images I only see black
   - This may be due to the selected pixel format. If for example a Mono10 pixel format is chosen for
     the camera, the resulting pixel intensities are written to 16bit fields in the used image buffer

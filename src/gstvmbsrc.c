@@ -89,7 +89,8 @@ enum
     PROP_TRIGGERSOURCE,
     PROP_TRIGGERACTIVATION,
     PROP_INCOMPLETE_FRAME_HANDLING,
-    PROP_ALLOCATION_MODE
+    PROP_ALLOCATION_MODE,
+    PROP_NUM_FRAME_BUFFERS
 };
 
 /* pad templates */
@@ -502,6 +503,17 @@ static void gst_vmbsrc_class_init(GstVmbSrcClass *klass)
             GST_ENUM_ALLOCATIONMODE_VALUES,
             GST_VMBSRC_ALLOCATION_MODE_ANNOUNCE_FRAME,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_NUM_FRAME_BUFFERS,
+        g_param_spec_int(
+            "framebuffers",
+            "Number of frame buffers to allocate",
+            "Configures the number of frame buffers that are allocated for transmission from the device to the host. This number should be chosen large enough to not starve the system of free buffers for transmission",
+            1,
+            G_MAXINT,
+            5,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 }
 
 static void gst_vmbsrc_init(GstVmbSrc *vmbsrc)
@@ -630,6 +642,11 @@ static void gst_vmbsrc_init(GstVmbSrc *vmbsrc)
             g_object_class_find_property(
                 gobject_class,
                 "allocationmode")));
+    vmbsrc->num_frame_buffers = g_value_get_int(
+        g_param_spec_get_default_value(
+            g_object_class_find_property(
+                gobject_class,
+                "framebuffers")));
 
     gst_video_info_init(&vmbsrc->video_info);
 }
@@ -697,6 +714,9 @@ void gst_vmbsrc_set_property(GObject *object, guint property_id, const GValue *v
         break;
     case PROP_ALLOCATION_MODE:
         vmbsrc->properties.allocation_mode = g_value_get_enum(value);
+        break;
+    case PROP_NUM_FRAME_BUFFERS:
+        vmbsrc->num_frame_buffers = g_value_get_int(value);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
@@ -976,6 +996,9 @@ void gst_vmbsrc_get_property(GObject *object, guint property_id, GValue *value, 
     case PROP_ALLOCATION_MODE:
         g_value_set_enum(value, vmbsrc->properties.incomplete_frame_handling);
         break;
+    case PROP_NUM_FRAME_BUFFERS:
+        g_value_set_int(value, vmbsrc->num_frame_buffers);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
         break;
@@ -1169,6 +1192,10 @@ static gboolean gst_vmbsrc_set_caps(GstBaseSrc *src, GstCaps *caps)
     // Buffer size needs to be increased if the new payload size is greater than the old one because that means the
     // previously allocated buffers are not large enough. We simply check the size of the first buffer because they were
     // all allocated with the same size
+    if (vmbsrc->frame_buffers == NULL)
+    {
+        vmbsrc->frame_buffers = calloc(vmbsrc->num_frame_buffers, sizeof *vmbsrc->frame_buffers);
+    }
     VmbUint32_t new_payload_size;
     result = VmbPayloadSizeGet(vmbsrc->camera.handle, &new_payload_size);
     if (vmbsrc->frame_buffers[0].bufferSize < new_payload_size || result != VmbErrorSuccess)
@@ -1923,10 +1950,10 @@ VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc)
     if (result == VmbErrorSuccess)
     {
         GST_DEBUG_OBJECT(vmbsrc, "Got \"PayloadSize\" of: %u", payload_size);
-        GST_DEBUG_OBJECT(vmbsrc, "Allocating and announcing %d VimbaX frames", NUM_FRAME_BUFFERS);
+        GST_DEBUG_OBJECT(vmbsrc, "Allocating and announcing %d VimbaX frames", vmbsrc->num_frame_buffers);
         GEnumValue *allocation_mode = g_enum_get_value(g_type_class_ref(GST_ENUM_ALLOCATIONMODE_VALUES), vmbsrc->properties.allocation_mode);
         GST_DEBUG_OBJECT(vmbsrc, "Using allocation mode %s", allocation_mode->value_nick);
-        for (int i = 0; i < NUM_FRAME_BUFFERS; i++)
+        for (int i = 0; i < vmbsrc->num_frame_buffers; i++)
         {
             if (vmbsrc->properties.allocation_mode == GST_VMBSRC_ALLOCATION_MODE_ANNOUNCE_FRAME)
             {
@@ -1982,7 +2009,7 @@ VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc)
  */
 void revoke_and_free_buffers(GstVmbSrc *vmbsrc)
 {
-    for (int i = 0; i < NUM_FRAME_BUFFERS; i++)
+    for (int i = 0; i < vmbsrc->num_frame_buffers; i++)
     {
         if (NULL != vmbsrc->frame_buffers[i].buffer)
         {
@@ -2012,7 +2039,7 @@ VmbError_t start_image_acquisition(GstVmbSrc *vmbsrc)
     if (result == VmbErrorSuccess)
     {
         GST_DEBUG_OBJECT(vmbsrc, "Queueing the VimbaX frames");
-        for (int i = 0; i < NUM_FRAME_BUFFERS; i++)
+        for (int i = 0; i < vmbsrc->num_frame_buffers; i++)
         {
             // Queue Frame
             result = VmbCaptureFrameQueue(vmbsrc->camera.handle, &vmbsrc->frame_buffers[i], &vimbax_frame_callback);

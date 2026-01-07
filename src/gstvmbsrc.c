@@ -1192,10 +1192,6 @@ static gboolean gst_vmbsrc_set_caps(GstBaseSrc *src, GstCaps *caps)
     // Buffer size needs to be increased if the new payload size is greater than the old one because that means the
     // previously allocated buffers are not large enough. We simply check the size of the first buffer because they were
     // all allocated with the same size
-    if (vmbsrc->frame_buffers == NULL)
-    {
-        vmbsrc->frame_buffers = calloc(vmbsrc->num_frame_buffers, sizeof *vmbsrc->frame_buffers);
-    }
     VmbUint32_t new_payload_size;
     result = VmbPayloadSizeGet(vmbsrc->camera.handle, &new_payload_size);
     if (vmbsrc->frame_buffers[0].bufferSize < new_payload_size || result != VmbErrorSuccess)
@@ -1223,6 +1219,11 @@ static gboolean gst_vmbsrc_start(GstBaseSrc *src)
 
     // Prepare queue for filled frames from which vmbsrc_create can take them
     vmbsrc->filled_frame_queue = g_async_queue_new();
+
+    if (vmbsrc->frame_buffers == NULL)
+    {
+        vmbsrc->frame_buffers = calloc(vmbsrc->num_frame_buffers, sizeof *vmbsrc->frame_buffers);
+    }
 
     VmbError_t result;
 

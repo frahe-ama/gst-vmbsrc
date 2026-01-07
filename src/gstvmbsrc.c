@@ -1301,6 +1301,9 @@ static gboolean gst_vmbsrc_stop(GstBaseSrc *src)
 
     revoke_and_free_buffers(vmbsrc);
 
+    free(vmbsrc->frame_buffers);
+    vmbsrc->frame_buffers = NULL;
+
     // Unref the filled frame queue so it is deleted properly
     g_async_queue_unref(vmbsrc->filled_frame_queue);
 

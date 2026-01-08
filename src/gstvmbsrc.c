@@ -1367,8 +1367,17 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
         }
     } while (!submit_frame);
 
-    // Prepare output buffer that will be filled with frame data
-    GstBuffer *buffer = gst_buffer_new_and_alloc(frame->bufferSize);
+    // Create GstBuffer in such a way that the registered callback is called once the buffer is no
+    // longer used by the pipeline. In the callback we can requeue the frame for further transfers
+    // from the camera.
+    GstBuffer* buffer = gst_buffer_new_wrapped_full(
+        0, /* TODO: Any flags needed here instead of just 0? */
+        frame->imageData, /* TODO: Should this instead be frame->buffer and the offset argument below pass the offset to imageData in the buffer? */
+        frame->bufferSize,
+        0,
+        frame->bufferSize /* TODO: Is this correct? Might not be entirely true for buffers that contain padding for alignment reasons or chunk data */,
+        frame,
+        &glib_destroy_callback );
 
     // Add a timestamp to the buffer. This is done before copying image data in to keep the
     // timestamp as close to acquisition as possible
@@ -1381,17 +1390,6 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
     }
     GST_BUFFER_TIMESTAMP(buffer) = timestamp;
     GST_BUFFER_DURATION(buffer) = GST_CLOCK_TIME_NONE;
-
-    // copy over frame data into the GStreamer buffer
-    // TODO: Investigate if we can work without copying to improve performance?
-    gst_buffer_fill(
-        buffer,
-        0,
-        frame->buffer,
-        frame->bufferSize);
-
-    // requeue frame after we copied the image data for VimbaX to use again
-    VmbCaptureFrameQueue(vmbsrc->camera.handle, frame, &vimbax_frame_callback);
 
     // Manually calculate the stride for pixel rows as it might not be identical to GStreamer
     // expectations
@@ -1989,7 +1987,8 @@ VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc)
             }
 
             vmbsrc->frame_buffers[i].bufferSize = (VmbUint32_t)payload_size;
-            vmbsrc->frame_buffers[i].context[0] = vmbsrc->filled_frame_queue;
+            vmbsrc->frame_buffers[i].context[0] = vmbsrc->filled_frame_queue;   // used in vimbax_frame_callback to put filled frames to the queue
+            vmbsrc->frame_buffers[i].context[1] = vmbsrc->camera.handle;        // used in glib_destroy_callback to requeue frame for future transfers
 
             // Announce Frame
             result = VmbFrameAnnounce(vmbsrc->camera.handle,
@@ -2106,6 +2105,17 @@ VmbError_t stop_image_acquisition(GstVmbSrc *vmbsrc)
     VmbCaptureQueueFlush(vmbsrc->camera.handle);
 
     return result;
+}
+
+// Callback that will be executed when the GstBuffer instances created by this source are no longer
+// referenced by any elements further down the pipeline. Since the GstBuffer uses the same memory as
+// the VmbFrame_t that is used to transfer images to avoid copies, this callback is used to requeue
+// the frame back for further transmissions from the device
+void glib_destroy_callback(gpointer data)
+{
+    VmbFrame_t *frame = data;
+    VmbCaptureFrameQueue(frame->context[1], frame, &vimbax_frame_callback);
+    GST_DEBUG("destroy callback is called");
 }
 
 void VMB_CALL vimbax_frame_callback(const VmbHandle_t camera_handle, const VmbHandle_t stream_handle, VmbFrame_t *frame)

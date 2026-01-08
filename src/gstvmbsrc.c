@@ -2130,7 +2130,7 @@ void VMB_CALL vimbax_frame_callback(const VmbHandle_t camera_handle, const VmbHa
 {
     UNUSED(camera_handle); // enable compilation while treating warning of unused vairable as error
     UNUSED(stream_handle);
-    GST_TRACE("Got Frame");
+    GST_TRACE("Got Frame %i", frame->frameID);
     g_async_queue_push(frame->context[0], frame); // context[0] holds vmbsrc->filled_frame_queue
 
     // requeueing the frame is done after it was consumed in vmbsrc_create

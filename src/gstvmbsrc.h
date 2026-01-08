@@ -148,8 +148,6 @@ typedef enum
 typedef struct _GstVmbSrc GstVmbSrc;
 typedef struct _GstVmbSrcClass GstVmbSrcClass;
 
-#define NUM_FRAME_BUFFERS 3
-
 struct _GstVmbSrc
 {
     GstPushSrc base_vmbsrc;
@@ -185,7 +183,8 @@ struct _GstVmbSrc
         int allocation_mode;
     } properties;
 
-    VmbFrame_t frame_buffers[NUM_FRAME_BUFFERS];
+    int num_frame_buffers;
+    VmbFrame_t* frame_buffers;
     // queue in which filled VimbaX frames are placed in the vimbax_frame_callback (attached to each queued frame at
     // frame->context[0])
     GAsyncQueue *filled_frame_queue;

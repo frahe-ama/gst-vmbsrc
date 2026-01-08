@@ -2113,9 +2113,17 @@ VmbError_t stop_image_acquisition(GstVmbSrc *vmbsrc)
 // the frame back for further transmissions from the device
 void glib_destroy_callback(gpointer data)
 {
+    GST_TRACE("glib_destroy_callback is called");
     VmbFrame_t *frame = data;
-    VmbCaptureFrameQueue(frame->context[1], frame, &vimbax_frame_callback);
-    GST_DEBUG("destroy callback is called");
+    VmbError_t err = VmbCaptureFrameQueue(frame->context[1], frame, &vimbax_frame_callback);
+    if (err != VmbErrorSuccess)
+    {
+        GST_ERROR("VmbCaptureFrameQueue failed with error code %i", err);
+    }
+    else
+    {
+        GST_DEBUG("VmbCaptureFrameQueue returned %i", err);
+    }
 }
 
 void VMB_CALL vimbax_frame_callback(const VmbHandle_t camera_handle, const VmbHandle_t stream_handle, VmbFrame_t *frame)

@@ -2133,7 +2133,8 @@ void VMB_CALL vimbax_frame_callback(const VmbHandle_t camera_handle, const VmbHa
     GST_TRACE("Got Frame %i", frame->frameID);
     g_async_queue_push(frame->context[0], frame); // context[0] holds vmbsrc->filled_frame_queue
 
-    // requeueing the frame is done after it was consumed in vmbsrc_create
+    // requeueing the frame is done after the GstBuffer created in vmbsrc_create is no longer
+    // referenced in the pipeline. For this the callback function glib_destroy_callback is used
 }
 
 /**

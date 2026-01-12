@@ -1388,6 +1388,8 @@ static GstBuffer* gst_vmbsrc_frame_to_buffer(GstVmbSrc *vmbsrc, VmbFrame_t *fram
             frame,
             &glib_destroy_callback );
     }
+#else
+    UNUSED(vmbsrc);
 #endif
 
     return gst_buffer_new_wrapped_full(
@@ -2130,6 +2132,8 @@ VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc, GstVideoInfo *video_inf
                 }
 
                 vmbsrc->frame_buffers[i].buffer = surf->surfaceList[0].mappedAddr.addr[0];
+#else
+                UNUSED(video_info);
 #endif  
             }
             else if (vmbsrc->properties.allocation_mode == GST_VMBSRC_ALLOCATION_MODE_ANNOUNCE_FRAME)

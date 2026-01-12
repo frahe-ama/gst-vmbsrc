@@ -49,6 +49,10 @@
 #include <stdlib.h>
 #endif
 
+#if HAVE_NVMM
+#include <nvbufsurface.h>
+#endif
+
 #include <VmbC/VmbC.h>
 
 // Counter variable to keep track of calls to VmbStartup() and VmbShutdown()
@@ -57,6 +61,19 @@ G_LOCK_DEFINE(vmb_open_count);
 
 GST_DEBUG_CATEGORY_STATIC(gst_vmbsrc_debug_category);
 #define GST_CAT_DEFAULT gst_vmbsrc_debug_category
+
+#define GST_CAPS_FEATURE_MEMORY_NVMM      "memory:NVMM"
+
+#if HAVE_NVMM
+
+#define GST_VMBSRC_CAPS_NVMM \
+    ";" GST_VIDEO_CAPS_MAKE_WITH_FEATURES(GST_CAPS_FEATURE_MEMORY_NVMM, "{ GRAY8, RGB, BGR, UYVY, BGRx, RGBA }")
+#else
+#define GST_VMBSRC_CAPS_NVMM
+#endif
+
+#define GST_VMBSRC_CAPS_DEFAULT \
+    GST_VIDEO_CAPS_MAKE(GST_VIDEO_FORMATS_ALL) ";" GST_BAYER_CAPS_MAKE(GST_BAYER_FORMATS_ALL)
 
 /* prototypes */
 
@@ -98,8 +115,7 @@ static GstStaticPadTemplate gst_vmbsrc_src_template =
     GST_STATIC_PAD_TEMPLATE("src",
                             GST_PAD_SRC,
                             GST_PAD_ALWAYS,
-                            GST_STATIC_CAPS(
-                                GST_VIDEO_CAPS_MAKE(GST_VIDEO_FORMATS_ALL) ";" GST_BAYER_CAPS_MAKE(GST_BAYER_FORMATS_ALL)));
+                            GST_STATIC_CAPS(GST_VMBSRC_CAPS_DEFAULT GST_VMBSRC_CAPS_NVMM));
 
 /* Auto exposure modes */
 #define GST_ENUM_EXPOSUREAUTO_MODES (gst_vmbsrc_exposureauto_get_type())
@@ -1092,6 +1108,17 @@ static GstCaps *gst_vmbsrc_get_caps(GstBaseSrc *src, GstCaps *filter)
                           // Mark the framerate as variable because triggering might cause variable framerate
                           "framerate", GST_TYPE_FRACTION, 0, 1,
                           NULL);
+#if HAVE_NVMM
+        GstStructure *nvmm_raw_caps = gst_caps_get_structure(caps, 2);
+
+        gst_structure_set_value(nvmm_raw_caps, "width", &width);
+        gst_structure_set_value(nvmm_raw_caps, "height", &height);
+        gst_structure_set(nvmm_raw_caps,
+                          // TODO: Check if framerate should also be gotten from camera (e.g. as max-framerate here)
+                          // Mark the framerate as variable because triggering might cause variable framerate
+                          "framerate", GST_TYPE_FRACTION, 0, 1,
+                          NULL);
+#endif 
 
         // Query supported pixel formats from camera and map them to GStreamer formats
         GValue pixel_format_raw_list = G_VALUE_INIT;
@@ -1130,6 +1157,7 @@ static GstCaps *gst_vmbsrc_get_caps(GstBaseSrc *src, GstCaps *filter)
 static gboolean gst_vmbsrc_set_caps(GstBaseSrc *src, GstCaps *caps)
 {
     GstVmbSrc *vmbsrc = GST_vmbsrc(src);
+    GstCapsFeatures *feat;
 
     GST_TRACE_OBJECT(vmbsrc, "set_caps");
 
@@ -1186,6 +1214,27 @@ static gboolean gst_vmbsrc_set_caps(GstBaseSrc *src, GstCaps *caps)
         return FALSE;
     }
 
+
+    feat = gst_caps_get_features(caps, 0);
+    if (gst_caps_features_contains(feat, GST_CAPS_FEATURE_MEMORY_NVMM))
+    {
+        vmbsrc->use_nvmm = true;
+    }
+    
+    if (vmbsrc->use_nvmm && vmbsrc->properties.allocation_mode == GST_VMBSRC_ALLOCATION_MODE_ALLOC_AND_ANNOUNCE_FRAME)
+    {
+        GST_ERROR_OBJECT(vmbsrc, "NVMM incompatible with alloc and announce allocation mode");
+        return FALSE;
+    }
+
+    // TODO: Check if vmbsrc->video_info can be directly initialized here
+    GstVideoInfo video_info = { 0 };
+    if (!gst_video_info_from_caps(&video_info, caps))
+    {
+        return FALSE;
+    }
+
+
     // width and height are always the value that is already written on the camera because get_caps only reports that
     // value. Setting it here is not necessary as the feature values are controlled via properties of the element.
 
@@ -1200,14 +1249,21 @@ static gboolean gst_vmbsrc_set_caps(GstBaseSrc *src, GstCaps *caps)
         GST_DEBUG_OBJECT(vmbsrc,
                          "PayloadSize increased or has not been set yet. Reallocating frame buffers to ensure enough space");
         revoke_and_free_buffers(vmbsrc);
-        result = alloc_and_announce_buffers(vmbsrc);
+        result = alloc_and_announce_buffers(vmbsrc, &video_info);
     }
     if (result == VmbErrorSuccess)
     {
         result = start_image_acquisition(vmbsrc);
     }
 
-    return result == VmbErrorSuccess ? gst_video_info_from_caps(&vmbsrc->video_info, caps) : FALSE;
+    if (result != VmbErrorSuccess)
+    {
+        return FALSE;
+    }
+
+    vmbsrc->video_info = video_info;
+
+    return TRUE;
 }
 
 /* start and stop processing, ideal for opening/closing the resource */
@@ -1224,6 +1280,8 @@ static gboolean gst_vmbsrc_start(GstBaseSrc *src)
     {
         vmbsrc->frame_buffers = calloc(vmbsrc->num_frame_buffers, sizeof *vmbsrc->frame_buffers);
     }
+
+    vmbsrc->use_nvmm = false;
 
     VmbError_t result;
 
@@ -1311,6 +1369,37 @@ static gboolean gst_vmbsrc_stop(GstBaseSrc *src)
     return TRUE;
 }
 
+static GstBuffer* gst_vmbsrc_frame_to_buffer(GstVmbSrc *vmbsrc, VmbFrame_t *frame)
+{
+#if HAVE_NVMM
+    if (vmbsrc->use_nvmm)
+    {
+        NvBufSurface *surf = frame->context[2];
+
+        surf->surfaceList[0].planeParams.width[0] = frame->width;
+        surf->surfaceList[0].planeParams.height[0] = frame->height;
+
+        return gst_buffer_new_wrapped_full(
+            0, 
+            surf, 
+            sizeof(*surf),
+            0,
+            sizeof(*surf),
+            frame,
+            &glib_destroy_callback );
+    }
+#endif
+
+    return gst_buffer_new_wrapped_full(
+        0, /* TODO: Any flags needed here instead of just 0? */
+        frame->imageData, /* TODO: Should this instead be frame->buffer and the offset argument below pass the offset to imageData in the buffer? */
+        frame->bufferSize,
+        0,
+        frame->bufferSize /* TODO: Is this correct? Might not be entirely true for buffers that contain padding for alignment reasons or chunk data */,
+        frame,
+        &glib_destroy_callback );
+}
+
 /* ask the subclass to create a buffer */
 static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
 {
@@ -1370,14 +1459,7 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
     // Create GstBuffer in such a way that the registered callback is called once the buffer is no
     // longer used by the pipeline. In the callback we can requeue the frame for further transfers
     // from the camera.
-    GstBuffer* buffer = gst_buffer_new_wrapped_full(
-        0, /* TODO: Any flags needed here instead of just 0? */
-        frame->imageData, /* TODO: Should this instead be frame->buffer and the offset argument below pass the offset to imageData in the buffer? */
-        frame->bufferSize,
-        0,
-        frame->bufferSize /* TODO: Is this correct? Might not be entirely true for buffers that contain padding for alignment reasons or chunk data */,
-        frame,
-        &glib_destroy_callback );
+    GstBuffer* buffer = gst_vmbsrc_frame_to_buffer(vmbsrc, frame);
 
     // Add a timestamp to the buffer. This is done before copying image data in to keep the
     // timestamp as close to acquisition as possible
@@ -1939,13 +2021,45 @@ VmbError_t apply_trigger_settings(GstVmbSrc *vmbsrc)
     return result;
 }
 
+NvBufSurfaceColorFormat get_nvmm_format(GstVideoInfo *video_info)
+{
+    int video_fmt = GST_VIDEO_INFO_FORMAT(video_info);
+    switch (video_fmt)
+    {
+    case GST_VIDEO_FORMAT_GRAY8:
+        return NVBUF_COLOR_FORMAT_GRAY8;
+    case GST_VIDEO_FORMAT_UYVY:
+        return NVBUF_COLOR_FORMAT_UYVY;  
+    case GST_VIDEO_FORMAT_YUY2:
+        return NVBUF_COLOR_FORMAT_YUYV;
+    case GST_VIDEO_FORMAT_RGB:
+        return NVBUF_COLOR_FORMAT_RGB;
+    case GST_VIDEO_FORMAT_BGR:
+        return NVBUF_COLOR_FORMAT_BGR;
+    case GST_VIDEO_FORMAT_BGRx:
+        return NVBUF_COLOR_FORMAT_BGRx;
+    case GST_VIDEO_FORMAT_RGBA:
+        return NVBUF_COLOR_FORMAT_RGBA;
+    default:
+        GST_ERROR("Format %d not supported", video_fmt);
+        return NVBUF_COLOR_FORMAT_INVALID;
+    }
+}
+
+static uint32_t align_to(uint32_t value, uint32_t alignment)
+{
+    const uint32_t mask = alignment - 1;
+    const uint32_t offset_to_next = (alignment - (value & mask)) & mask;
+    return value + offset_to_next;
+}
+
 /**
  * @brief Gets the PayloadSize from the connected camera, allocates and announces frame buffers for capturing
  *
  * @param vmbsrc Provides the camera handle used for the VmbC calls and holds the frame buffers
  * @return VmbError_t Return status indicating errors if they occurred
  */
-VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc)
+VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc, GstVideoInfo *video_info)
 {
     VmbUint32_t payload_size;
     VmbError_t result = VmbPayloadSizeGet(vmbsrc->camera.handle, &payload_size);
@@ -1957,7 +2071,66 @@ VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc)
         GST_DEBUG_OBJECT(vmbsrc, "Using allocation mode %s", allocation_mode->value_nick);
         for (int i = 0; i < vmbsrc->num_frame_buffers; i++)
         {
-            if (vmbsrc->properties.allocation_mode == GST_VMBSRC_ALLOCATION_MODE_ANNOUNCE_FRAME)
+            
+            
+            if (vmbsrc->use_nvmm && HAVE_NVMM)
+            {
+#if HAVE_NVMM
+                /*   In the NVMM buffer allocation it is not possible to pass a specific buffer size. 
+                 *   The buffer size also always automatically calculated based on the width and height,
+                 *   but for certain interfaces meta data e.g. chunk is stored in the same
+                 *   buffer as the image data. To ensure that the NVMM buffer is always large enough
+                 *   the height used for allocation is adjusted. Once the image is received completly
+                 *   the height in overriden with the actual value.
+                 */
+                const uint32_t pitch = align_to(GST_VIDEO_INFO_PLANE_STRIDE(video_info, 0), 256);
+                const uint32_t aligned_payload_size = align_to(payload_size, 4096);
+                const uint32_t buffer_height = aligned_payload_size / pitch;
+
+                GST_DEBUG("Using a height of %u for NVMM allocation\n", buffer_height);
+
+                NvBufSurface *surf = NULL;
+                NvBufSurfaceAllocateParams paramsext = { 0 };       
+                paramsext.params.gpuId = 0;
+                paramsext.params.width = GST_VIDEO_INFO_WIDTH(video_info);
+                paramsext.params.height = buffer_height;
+                paramsext.params.size = payload_size; 
+                paramsext.params.colorFormat = get_nvmm_format(video_info); 
+                paramsext.params.layout = NVBUF_LAYOUT_PITCH;
+                paramsext.params.memType = NVBUF_MEM_SURFACE_ARRAY;
+                paramsext.memtag = NvBufSurfaceTag_CAMERA;
+
+                int err = NvBufSurfaceAllocate(&surf, 1, &paramsext);
+                if (err)
+                {
+                    result = VmbErrorOther;
+                    break;
+                }
+
+                const uint32_t surf_pitch = surf->surfaceList[0].planeParams.pitch[0];
+                const uint32_t camera_pitch = surf->surfaceList[0].planeParams.bytesPerPix[0] * paramsext.params.width;
+
+                if (camera_pitch != surf_pitch) 
+                {
+                    g_printerr ("width pitch missmatch detected got: %u, required: %u\n", camera_pitch, surf_pitch);
+                    return VmbErrorBadParameter;
+                }
+
+                vmbsrc->frame_buffers[i].context[2] = surf;
+
+                surf->numFilled = 1;
+                
+                err = NvBufSurfaceMap(surf, 0, 0, NVBUF_MAP_READ_WRITE);
+                if (err)
+                {
+                    result = VmbErrorInvalidAddress;
+                    break;
+                }
+
+                vmbsrc->frame_buffers[i].buffer = surf->surfaceList[0].mappedAddr.addr[0];
+#endif  
+            }
+            else if (vmbsrc->properties.allocation_mode == GST_VMBSRC_ALLOCATION_MODE_ANNOUNCE_FRAME)
             {
                 // The element is responsible for allocating frame buffers. Some transport layers
                 // provide higher performance if specific alignment is observed. Check if this
@@ -2017,7 +2190,16 @@ void revoke_and_free_buffers(GstVmbSrc *vmbsrc)
         if (NULL != vmbsrc->frame_buffers[i].buffer)
         {
             VmbFrameRevoke(vmbsrc->camera.handle, &vmbsrc->frame_buffers[i]);
-            if (vmbsrc->properties.allocation_mode == GST_VMBSRC_ALLOCATION_MODE_ANNOUNCE_FRAME)
+            if (vmbsrc->use_nvmm  && HAVE_NVMM)
+            {
+#if HAVE_NVMM           
+                NvBufSurface *surf = vmbsrc->frame_buffers[i].context[2];
+
+                NvBufSurfaceUnMap(surf, 0, 0);
+                NvBufSurfaceDestroy(surf);
+#endif                
+            }
+            else if (vmbsrc->properties.allocation_mode == GST_VMBSRC_ALLOCATION_MODE_ANNOUNCE_FRAME)
             {
                 // The element allocated the frame buffers, so it must free the memory also
                 VmbAlignedFree(vmbsrc->frame_buffers[i].buffer);
@@ -2130,7 +2312,7 @@ void VMB_CALL vimbax_frame_callback(const VmbHandle_t camera_handle, const VmbHa
 {
     UNUSED(camera_handle); // enable compilation while treating warning of unused vairable as error
     UNUSED(stream_handle);
-    GST_TRACE("Got Frame %i", frame->frameID);
+    GST_TRACE("Got Frame %llu", frame->frameID);
     g_async_queue_push(frame->context[0], frame); // context[0] holds vmbsrc->filled_frame_queue
 
     // requeueing the frame is done after the GstBuffer created in vmbsrc_create is no longer

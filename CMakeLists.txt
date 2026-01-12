@@ -30,15 +30,22 @@ target_compile_definitions(${PROJECT_NAME}
         HAVE_CONFIG_H
 )
 
+find_package(GStreamer REQUIRED COMPONENTS base video)
+find_package(GLIB2 REQUIRED)
+find_package(GObject REQUIRED)
+find_package(NvBufSurface)
+find_package(Vmb REQUIRED COMPONENTS C)
+
+if (NVBUFSURFACE_FOUND)
+    set(HAVE_NVMM ON)
+    target_link_libraries(${PROJECT_NAME} NvBufSurface::NvBufSurface)
+endif ()
+
+
 # fill configuration file with defined values
 configure_file(
     ${PROJECT_SOURCE_DIR}/src/config.h.in config.h
 )
-
-find_package(GStreamer REQUIRED COMPONENTS base video)
-find_package(GLIB2 REQUIRED)
-find_package(GObject REQUIRED)
-find_package(Vmb REQUIRED COMPONENTS C)
 
 target_include_directories(${PROJECT_NAME}
     PRIVATE
@@ -55,6 +62,7 @@ target_link_libraries (${PROJECT_NAME}
     ${GSTREAMER_VIDEO_LIBRARY}
     Vmb::C
 )
+
 
 install(
     TARGETS ${PROJECT_NAME}

@@ -190,6 +190,8 @@ struct _GstVmbSrc
     GAsyncQueue *filled_frame_queue;
     guint64 num_frames_pushed;
     GstVideoInfo video_info;
+
+    bool use_nvmm;
 };
 
 struct _GstVmbSrcClass
@@ -205,7 +207,7 @@ VmbError_t open_camera_connection(GstVmbSrc *vmbsrc);
 VmbError_t apply_feature_settings(GstVmbSrc *vmbsrc);
 VmbError_t set_roi(GstVmbSrc *vmbsrc);
 VmbError_t apply_trigger_settings(GstVmbSrc *vmbsrc);
-VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc);
+VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc, GstVideoInfo *video_info);
 void revoke_and_free_buffers(GstVmbSrc *vmbsrc);
 VmbError_t start_image_acquisition(GstVmbSrc *vmbsrc);
 VmbError_t stop_image_acquisition(GstVmbSrc *vmbsrc);

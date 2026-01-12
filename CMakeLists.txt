@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.12)
 
 project(
     gstvmbsrc
-    VERSION 1.0.0
+    VERSION 1.1.0
     LANGUAGES C
     DESCRIPTION "GStreamer source plugin for VimbaX"
     HOMEPAGE_URL "https://alliedvision.com/"

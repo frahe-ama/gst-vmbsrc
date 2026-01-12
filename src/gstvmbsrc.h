@@ -209,6 +209,7 @@ VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc);
 void revoke_and_free_buffers(GstVmbSrc *vmbsrc);
 VmbError_t start_image_acquisition(GstVmbSrc *vmbsrc);
 VmbError_t stop_image_acquisition(GstVmbSrc *vmbsrc);
+void glib_destroy_callback(gpointer data);
 void VMB_CALL vimbax_frame_callback(const VmbHandle_t cameraHandle, const VmbHandle_t stream_handle, VmbFrame_t *pFrame);
 void map_supported_pixel_formats(GstVmbSrc *vmbsrc);
 void log_available_enum_entries(GstVmbSrc *vmbsrc, const char *feat_name);

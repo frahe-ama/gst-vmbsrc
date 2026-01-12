@@ -2021,7 +2021,8 @@ VmbError_t apply_trigger_settings(GstVmbSrc *vmbsrc)
     return result;
 }
 
-NvBufSurfaceColorFormat get_nvmm_format(GstVideoInfo *video_info)
+#if HAVE_NVMM
+static NvBufSurfaceColorFormat get_nvmm_format(GstVideoInfo *video_info)
 {
     int video_fmt = GST_VIDEO_INFO_FORMAT(video_info);
     switch (video_fmt)
@@ -2045,6 +2046,7 @@ NvBufSurfaceColorFormat get_nvmm_format(GstVideoInfo *video_info)
         return NVBUF_COLOR_FORMAT_INVALID;
     }
 }
+#endif
 
 static uint32_t align_to(uint32_t value, uint32_t alignment)
 {

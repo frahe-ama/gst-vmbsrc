@@ -125,3 +125,45 @@ VmbInt64_t RoundToNearestValidValue(VmbInt64_t value, VmbInt64_t min, VmbInt64_t
     }
     return MAX(MIN((steps * increment) + min, max), min);
 }
+
+//
+// Calculate the size of the buffer required to store an image with given parameters
+//
+// Parameters:
+//  [in]    width       Width of the image in pixels
+//  [in]    height      height of the image in pixels
+//  [in]    format      Pixelformat of the image. The number of bytes used per pixel is determined from this
+//
+// Returns:
+//  The size of the image data in bytes. 0 if calculation of image data size was not possible due to unsupported format.
+//
+size_t calculateImageBufferSize(VmbImageDimension_t width, VmbImageDimension_t height, VmbPixelFormat_t format)
+{
+    size_t bytesPerPixel = 0;
+    VmbPixelOccupyType occupied = format & 0x00FF0000;
+    switch (occupied)
+    {
+    case VmbPixelOccupy8Bit:
+        bytesPerPixel = 1;
+        break;
+    case VmbPixelOccupy16Bit:
+        bytesPerPixel = 2;
+        break;
+    case VmbPixelOccupy24Bit:
+        bytesPerPixel = 3;
+        break;
+    case VmbPixelOccupy32Bit:
+        bytesPerPixel = 4;
+        break;
+    case VmbPixelOccupy48Bit:
+        bytesPerPixel = 6;
+        break;
+    case VmbPixelOccupy64Bit:
+        bytesPerPixel = 8;
+        break;
+    default:
+        // do not change bytes per pixel. It remains 0 -> function returns 0
+        break;
+    }
+    return width * height * bytesPerPixel;
+}

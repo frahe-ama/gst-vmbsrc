@@ -2048,7 +2048,6 @@ static NvBufSurfaceColorFormat get_nvmm_format(GstVideoInfo *video_info)
         return NVBUF_COLOR_FORMAT_INVALID;
     }
 }
-#endif
 
 static uint32_t align_to(uint32_t value, uint32_t alignment)
 {
@@ -2056,6 +2055,7 @@ static uint32_t align_to(uint32_t value, uint32_t alignment)
     const uint32_t offset_to_next = (alignment - (value & mask)) & mask;
     return value + offset_to_next;
 }
+#endif
 
 /**
  * @brief Gets the PayloadSize from the connected camera, allocates and announces frame buffers for capturing

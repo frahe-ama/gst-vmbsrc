@@ -22,6 +22,15 @@ To use the preset for configuration, pass the name as parameter to cmake by call
 from this, execute `cmake --build build-linux64`. On different platforms, different preset names and
 directory names must be used (e.g. `arm64` or `win64`).
 
+If cmake detects that the required Nvidia libraries are available, it will build a vmbsrc artifact
+that supports NVMM frame creation. This makes it possible to pass frames to accelerated GStreamer
+elements provided by Nvidia. This is most relevant for Nvidia Jetson boards. The best way to make
+sure that NVMM frames are used to pass image data along the pipeline is using a `capsfilter` element
+like so:
+```
+gst-launch-1.0 vmbsrc camera=DEV_1AB22D01BBB8 ! video/x-raw(memory:NVMM) ! ...
+```
+
 ### Docker build environment (Linux only)
 To simplify the setup of a reproducible build environment, a `Dockerfile` based on an Ubuntu 18.04
 base image is provided, which when build includes all necessary dependencies, except the Vimba X

@@ -62,6 +62,16 @@ gst-launch-1.0 vmbsrc camera=DEV_000F315B91E2 ! video/x-raw,format=RGB ! videora
 - `filesink location=output.avi`: saves the resulting video into a file named `output.avi` in the
   current working directory
 
+## Using  NVMM Memory for accelerated processing with Nvidia elements
+
+If vmbsrc was compiled on a system that had the required libraries available and is able to load the
+required libraries at runtime, it can produce frames that are stored in NvMM memory. These can be
+passed to accelerated pipeline elements from Nvidia to speed up processing. The easiest way to
+ensure that this is done is by using a `capsfilter` element in the pipeline:
+```
+gst-launch-1.0 vmbsrc camera=DEV_1AB22D01BBB8 ! video/x-raw(memory:NVMM) ! ...
+```
+
 ## Stream video via RTSP server
 
 RTSP (Real Time Streaming Protocol) is a network protocol designed to control streaming media

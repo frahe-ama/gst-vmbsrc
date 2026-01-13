@@ -78,7 +78,10 @@ specifying your GStreamer pipelines and check the [Troubleshooting](##Troublesho
 you encounter any issues**
 
 `vmbsrc` is intended for use in GStreamer pipelines. The element can be used to forward recorded
-frames from a Vimba X compatible camera into subsequent GStreamer elements.
+frames from a Vimba X compatible camera into subsequent GStreamer elements. To optimize performance
+the element attempts to avoid copies of image data as much as possible, reusing existing buffers
+whenever possible. For complex pipelines, this might require that the user manually adjusts the
+number of used framebuffers. for this a pipeline property named `framebuffers` is available.
 
 The following pipeline can for example be used to display the recorded camera image. The
 `camera=<CAMERA-ID>` parameter needs to be adjusted to use the correct camera ID.
@@ -243,7 +246,8 @@ is able to debayer the data into a widely accepted RGBA format.
   logged. The user may select whether they want to drop incomplete frames (default behavior) or to
   submit them into the pipeline for processing. Incomplete frames may contain pixel intensities from
   old acquisitions or random data. The behavior is selectable with the `incompleteframehandling`
-  property.
+  property. Additionally it is possible to increase the number of used framebuffers that the element
+  uses for frame transmissions via the `framebuffers` property.
 - Complex camera feature setups may not be possible using the provided properties (e.g. complex
   trigger setups for multiple trigger selectors). For those cases it is recommended to [use an XML
   file to pass the camera settings](####Using-an-XML-file).

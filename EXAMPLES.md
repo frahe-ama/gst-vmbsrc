@@ -72,6 +72,18 @@ ensure that this is done is by using a `capsfilter` element in the pipeline:
 gst-launch-1.0 vmbsrc camera=DEV_1AB22D01BBB8 ! video/x-raw(memory:NVMM) ! ...
 ```
 
+## Increasing the number of framebuffers
+
+If pipelines take a long time to process frames passed to them the vmbsrc might run out of buffers
+to use for transmissions from the device. In such situations it can be helpful to increase the
+number of buffers used by the element. For this the `framebuffers` property can be used:
+```
+gst-launch-1.0 vmbsrc camera=DEV_1AB22D01BBB8 framebuffers=25 ! ...
+```
+
+This property should not be confused with `num-buffers`, which is a standard GStreamer element
+property that specifies the number of images the element should produce before halting execution.
+
 ## Stream video via RTSP server
 
 RTSP (Real Time Streaming Protocol) is a network protocol designed to control streaming media

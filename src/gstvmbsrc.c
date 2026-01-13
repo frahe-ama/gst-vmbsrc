@@ -1371,6 +1371,7 @@ static gboolean gst_vmbsrc_stop(GstBaseSrc *src)
 
 static GstBuffer* gst_vmbsrc_frame_to_buffer(GstVmbSrc *vmbsrc, VmbFrame_t *frame)
 {
+    size_t imageSize = calculateImageBufferSize(frame->width, frame->height, frame->pixelFormat);
 #if HAVE_NVMM
     if (vmbsrc->use_nvmm)
     {
@@ -1394,10 +1395,10 @@ static GstBuffer* gst_vmbsrc_frame_to_buffer(GstVmbSrc *vmbsrc, VmbFrame_t *fram
 
     return gst_buffer_new_wrapped_full(
         0, /* TODO: Any flags needed here instead of just 0? */
-        frame->imageData, /* TODO: Should this instead be frame->buffer and the offset argument below pass the offset to imageData in the buffer? */
-        frame->bufferSize,
+        frame->imageData,
+        imageSize,
         0,
-        frame->bufferSize /* TODO: Is this correct? Might not be entirely true for buffers that contain padding for alignment reasons or chunk data */,
+        imageSize,
         frame,
         &glib_destroy_callback );
 }

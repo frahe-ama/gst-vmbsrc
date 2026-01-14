@@ -22,6 +22,15 @@ To use the preset for configuration, pass the name as parameter to cmake by call
 from this, execute `cmake --build build-linux64`. On different platforms, different preset names and
 directory names must be used (e.g. `arm64` or `win64`).
 
+If cmake detects that the required Nvidia libraries are available, it will build a vmbsrc artifact
+that supports NVMM frame creation. This makes it possible to pass frames to accelerated GStreamer
+elements provided by Nvidia. This is most relevant for Nvidia Jetson boards. The best way to make
+sure that NVMM frames are used to pass image data along the pipeline is using a `capsfilter` element
+like so:
+```
+gst-launch-1.0 vmbsrc camera=DEV_1AB22D01BBB8 ! video/x-raw(memory:NVMM) ! ...
+```
+
 ### Docker build environment (Linux only)
 To simplify the setup of a reproducible build environment, a `Dockerfile` based on an Ubuntu 18.04
 base image is provided, which when build includes all necessary dependencies, except the Vimba X
@@ -69,7 +78,10 @@ specifying your GStreamer pipelines and check the [Troubleshooting](##Troublesho
 you encounter any issues**
 
 `vmbsrc` is intended for use in GStreamer pipelines. The element can be used to forward recorded
-frames from a Vimba X compatible camera into subsequent GStreamer elements.
+frames from a Vimba X compatible camera into subsequent GStreamer elements. To optimize performance
+the element attempts to avoid copies of image data as much as possible, reusing existing buffers
+whenever possible. For complex pipelines, this might require that the user manually adjusts the
+number of used framebuffers. for this a pipeline property named `framebuffers` is available.
 
 The following pipeline can for example be used to display the recorded camera image. The
 `camera=<CAMERA-ID>` parameter needs to be adjusted to use the correct camera ID.
@@ -234,7 +246,8 @@ is able to debayer the data into a widely accepted RGBA format.
   logged. The user may select whether they want to drop incomplete frames (default behavior) or to
   submit them into the pipeline for processing. Incomplete frames may contain pixel intensities from
   old acquisitions or random data. The behavior is selectable with the `incompleteframehandling`
-  property.
+  property. Additionally it is possible to increase the number of used framebuffers that the element
+  uses for frame transmissions via the `framebuffers` property.
 - Complex camera feature setups may not be possible using the provided properties (e.g. complex
   trigger setups for multiple trigger selectors). For those cases it is recommended to [use an XML
   file to pass the camera settings](####Using-an-XML-file).

@@ -1,3 +1,15 @@
+# About this fork
+The official plugin laks some features which makes it not really usable in production environments. These features are added in this fork:
+- Loading of user presets. Now it is posible to load user presets by userset=UserSet1. In this case all other parameters will be ignored (except camera parameter). So it is possible to load a glean state.
+- No implicit setting of parameters. The official verseion sets implicitly some parameters, even if they aren't given. This may lead to unwanted effects if one does not set them to the desired values. Especially for loading UserSets this is unfavorible. Additionally it is now possible to set a default UserSet in the camera which the camera loads at startup. This will now survive when using just the camera parameter.
+- Small fixes for the parameter handling, which were a result of copy and paste, but not changing al variable names to the right name.
+
+## Warning
+This fork is generated with the help of an AI coding agent. The modifications were checked. Most of them are small. All of them follow the existing code structure and programming style. It is mainly a copy, paste and modify modification.
+
+Unfortunately the maintainer is no c++ programmer. The code was tested and worked like intended. There were no modifications regarding the pipline. All changes affect only the handling of commandline parameters and configuring the camera before the stream is started/loaded.
+
+
 # vmbsrc
 This project contains the official GStreamer plugin to make cameras supported by Allied Visions
 Vimba X API available as GStreamer sources.

@@ -53,6 +53,10 @@
 #include <nvbufsurface.h>
 #endif
 
+#if HAVE_DEEPSTREAM
+#include <nvds_latency_meta.h>
+#endif
+
 #include <VmbC/VmbC.h>
 
 // Counter variable to keep track of calls to VmbStartup() and VmbShutdown()
@@ -590,7 +594,11 @@ static void gst_vmbsrc_init(GstVmbSrc *vmbsrc)
     // Mark this element as a live source (disable preroll)
     gst_base_src_set_live(GST_BASE_SRC(vmbsrc), TRUE);
     gst_base_src_set_format(GST_BASE_SRC(vmbsrc), GST_FORMAT_TIME);
-    gst_base_src_set_do_timestamp(GST_BASE_SRC(vmbsrc), TRUE);
+    // Do NOT let GstBaseSrc timestamp the buffers automatically. do-timestamp stamps the buffer
+    // with the running-time at the moment create() returns (i.e. when the frame is dequeued),
+    // which hides the time a frame spent waiting in filled_frame_queue and adds jitter. We set an
+    // accurate frame-arrival timestamp ourselves in gst_vmbsrc_create instead.
+    gst_base_src_set_do_timestamp(GST_BASE_SRC(vmbsrc), FALSE);
 
     // Set property helper variables to default values
     GObjectClass *gobject_class = G_OBJECT_GET_CLASS(vmbsrc);
@@ -1508,16 +1516,45 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
     // from the camera.
     GstBuffer* buffer = gst_vmbsrc_frame_to_buffer(vmbsrc, frame);
 
-    // Add a timestamp to the buffer. This is done before copying image data in to keep the
-    // timestamp as close to acquisition as possible
+    // Timestamp the buffer with the running-time at which the frame actually arrived from the
+    // camera (recorded in vimbax_frame_callback), NOT the time create() dequeues it. Frames may
+    // sit in filled_frame_queue before create() picks them up; stamping at dequeue time would
+    // hide that queue residency and inject jitter, which corrupts downstream latency measurements
+    // (e.g. DeepStream frame/inference latency).
     GstClock *clock = gst_element_get_clock(GST_ELEMENT(vmbsrc));
-    GstClockTime timestamp = GST_CLOCK_TIME_NONE;
+    GstClockTime pts = GST_CLOCK_TIME_NONE;
     if (clock)
     {
-        timestamp = gst_clock_get_time(clock) - gst_element_get_base_time(GST_ELEMENT(vmbsrc));
+        GstClockTime now = gst_clock_get_time(clock);
+        GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(vmbsrc));
         g_object_unref(clock);
+
+        // Current running-time of the pipeline
+        GstClockTime now_running_time = (now >= base_time) ? (now - base_time) : 0;
+
+        // Determine how long ago the frame arrived using the elapsed monotonic delta. Only the
+        // delta is used (not the absolute monotonic value), so this stays correct for whatever
+        // clock the pipeline selected, as long as it advances in real time.
+        gint64 arrival_monotonic_us = (gint64)(guintptr)frame->context[3];
+        if (arrival_monotonic_us > 0)
+        {
+            GstClockTimeDiff age = (g_get_monotonic_time() - arrival_monotonic_us) * GST_USECOND;
+            if (age < 0)
+            {
+                age = 0;
+            }
+            pts = (now_running_time > (GstClockTime)age) ? (now_running_time - (GstClockTime)age) : 0;
+        }
+        else
+        {
+            // Arrival time was not recorded for some reason; fall back to the current running-time
+            pts = now_running_time;
+        }
     }
-    GST_BUFFER_TIMESTAMP(buffer) = timestamp;
+    GST_BUFFER_PTS(buffer) = pts;
+    // Framerate is advertised as variable (0/1) because triggering may produce a variable frame
+    // rate, so no meaningful constant buffer duration can be provided. DTS is left unset as is
+    // conventional for raw video.
     GST_BUFFER_DURATION(buffer) = GST_CLOCK_TIME_NONE;
 
     // Manually calculate the stride for pixel rows as it might not be identical to GStreamer
@@ -1541,6 +1578,15 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
 
     GST_BUFFER_OFFSET(buffer) = vmbsrc->num_frames_pushed;
     GST_BUFFER_OFFSET_END(buffer) = ++(vmbsrc->num_frames_pushed);
+
+#if HAVE_DEEPSTREAM
+    // Mark this element as the origin of the pipeline for DeepStream latency measurement. This
+    // attaches an input-system-timestamp meta so that, when NVDS_ENABLE_LATENCY_MEASUREMENT is
+    // set, DeepStream measures frame/component latency starting from this source rather than from
+    // the first NVIDIA element downstream. The call is a no-op when latency measurement is
+    // disabled, matching how the stock DeepStream elements use it.
+    nvds_set_input_system_timestamp(buffer, GST_ELEMENT_NAME(vmbsrc));
+#endif
 
     // Set filled GstBuffer as output to pass down the pipeline
     *buf = buffer;
@@ -2465,6 +2511,13 @@ void VMB_CALL vimbax_frame_callback(const VmbHandle_t camera_handle, const VmbHa
     UNUSED(camera_handle); // enable compilation while treating warning of unused vairable as error
     UNUSED(stream_handle);
     GST_TRACE("Got Frame %llu", frame->frameID);
+    // Record the moment the frame arrived from the camera, as early as possible, so that the
+    // buffer can later be timestamped with its true pipeline-entry time instead of the (possibly
+    // much later) time create() dequeues it. g_get_monotonic_time() returns microseconds and is
+    // stored in the otherwise unused user context slot context[3]. Storing the value in the
+    // pointer-sized slot relies on 64 bit pointers, which holds on the supported platforms and is
+    // consistent with the handles already kept in context[0]/context[1].
+    frame->context[3] = (void *)(guintptr)g_get_monotonic_time();
     g_async_queue_push(frame->context[0], frame); // context[0] holds vmbsrc->filled_frame_queue
 
     // requeueing the frame is done after the GstBuffer created in vmbsrc_create is no longer

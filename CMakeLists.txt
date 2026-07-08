@@ -34,11 +34,19 @@ find_package(GStreamer REQUIRED COMPONENTS base video)
 find_package(GLIB2 REQUIRED)
 find_package(GObject REQUIRED)
 find_package(NvBufSurface)
+find_package(DeepStream)
 find_package(Vmb REQUIRED COMPONENTS C)
 
 if (NVBUFSURFACE_FOUND)
     set(HAVE_NVMM ON)
     target_link_libraries(${PROJECT_NAME} NvBufSurface::NvBufSurface)
+endif ()
+
+# Optional: enables tagging buffers with a DeepStream input system timestamp so this element
+# becomes the origin for DeepStream latency measurement (NVDS_ENABLE_LATENCY_MEASUREMENT).
+if (DEEPSTREAM_FOUND)
+    set(HAVE_DEEPSTREAM ON)
+    target_link_libraries(${PROJECT_NAME} DeepStream::Meta)
 endif ()
 
 

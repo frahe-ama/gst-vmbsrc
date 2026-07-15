@@ -42,8 +42,9 @@ if (NVBUFSURFACE_FOUND)
     target_link_libraries(${PROJECT_NAME} NvBufSurface::NvBufSurface)
 endif ()
 
-# Optional: enables tagging buffers with a DeepStream input system timestamp so this element
-# becomes the origin for DeepStream latency measurement (NVDS_ENABLE_LATENCY_MEASUREMENT).
+# Optional: enables attaching a DeepStream NvDsMeta trigger record to each buffer. nvstreammux
+# transforms it into an NvDsUserMeta on the matching NvDsFrameMeta, so a DeepStream consumer can
+# read the trigger data off the frame with no bridging pad probe (see EXAMPLES.md).
 if (DEEPSTREAM_FOUND)
     set(HAVE_DEEPSTREAM ON)
     target_link_libraries(${PROJECT_NAME} DeepStream::Meta)

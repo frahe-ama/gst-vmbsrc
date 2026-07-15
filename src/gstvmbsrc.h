@@ -149,6 +149,60 @@ typedef enum
 typedef struct _GstVmbSrc GstVmbSrc;
 typedef struct _GstVmbSrcClass GstVmbSrcClass;
 
+/* One external hardware-trigger event, as fed in through the "notify-trigger" action signal. */
+typedef struct _GstVmbSrcTriggerEvent
+{
+    guint64 seq;                 // sequence number assigned by the external trigger source
+    GstClockTime monotonic_time; // trigger instant, CLOCK_MONOTONIC nanoseconds (g_get_monotonic_time()*1000)
+} GstVmbSrcTriggerEvent;
+
+/* -- Trigger metadata ------------------------------------------------------------------------
+ * The external hardware-trigger information correlated to a frame is attached to every buffer
+ * produced by vmbsrc so downstream consumers can pair each image with the right external data.
+ *
+ * It is carried as a GstCustomMeta (GStreamer >= 1.20) named GST_VMBSRC_TRIGGER_META_NAME whose
+ * GstStructure holds the fields below. Unlike a struct-based GstMeta, a GstCustomMeta is
+ * introspectable, so it can be read from Python without any custom bindings:
+ *
+ *     cmeta = buf.get_custom_meta("GstVmbSrcTriggerMeta")
+ *     if cmeta is not None:
+ *         s = cmeta.get_structure()
+ *         ok, seq = s.get_uint64("trigger-seq")
+ *
+ * From C, use gst_buffer_get_vmbsrc_trigger_meta() to read the fields into a GstVmbSrcTriggerMeta.
+ *
+ * IMPORTANT: the standard DeepStream muxer (nvstreammux) does NOT forward arbitrary GstMeta
+ * (custom metas included). To read this inside a DeepStream pipeline, use a pad probe on the
+ * nvstreammux SINK pad(s) - where the original source buffer is still visible - and copy the
+ * fields onto the corresponding NvDsFrameMeta (e.g. into misc_frame_info). See the reference
+ * probe in EXAMPLES.md.
+ */
+#define GST_VMBSRC_TRIGGER_META_NAME "GstVmbSrcTriggerMeta"
+
+// Plain value type holding the trigger fields read from a buffer's custom meta. Field values map
+// one-to-one to the GstStructure keys documented in gst_buffer_get_vmbsrc_trigger_meta().
+typedef struct _GstVmbSrcTriggerMeta
+{
+    guint64 trigger_seq;         // "trigger-seq": sequence number supplied by the external trigger
+                                 // source; the frame identity that stays aligned across drops
+    GstClockTime trigger_time;   // "trigger-time": the raw CLOCK_MONOTONIC trigger instant (ns)
+                                 // exactly as fed into notify-trigger, propagated unchanged for
+                                 // pairing with external data; or GST_CLOCK_TIME_NONE. (The buffer
+                                 // PTS, not this field, carries the running-time conversion.)
+    GstClockTime approx_latency; // "approx-latency": arrival-minus-trigger latency (ns), or NONE
+    guint64 camera_frame_id;     // "camera-frame-id": VmbFrame_t.frameID as reported by the camera
+    guint64 camera_timestamp;    // "camera-timestamp": VmbFrame_t.timestamp (raw camera clock ticks)
+    gboolean correlated;         // "correlated": TRUE if a matching trigger event was found
+} GstVmbSrcTriggerMeta;
+
+// Registers the custom meta (idempotent, thread-safe). Called during element class init so that
+// gst_buffer_add_custom_meta(GST_VMBSRC_TRIGGER_META_NAME) can find it.
+const GstMetaInfo *gst_vmbsrc_trigger_meta_get_info(void);
+
+// Reads the trigger custom meta from buffer into *out. Returns FALSE (leaving *out untouched) if
+// the buffer carries no trigger meta.
+gboolean gst_buffer_get_vmbsrc_trigger_meta(GstBuffer *buffer, GstVmbSrcTriggerMeta *out);
+
 struct _GstVmbSrc
 {
     GstPushSrc base_vmbsrc;
@@ -183,6 +237,9 @@ struct _GstVmbSrc
         int triggeractivation;
         int incomplete_frame_handling;
         int allocation_mode;
+        guint64 trigger_latency;            // nominal trigger->arrival latency in microseconds (0 = adaptive)
+        guint64 trigger_latency_tolerance;  // match acceptance half-window in microseconds (0 = accept nearest)
+        gboolean emit_trigger_latency_meta; // attach GstReferenceTimestampMeta for DeepStream latency
     } properties;
 
     int num_frame_buffers;
@@ -194,11 +251,34 @@ struct _GstVmbSrc
     GstVideoInfo video_info;
 
     bool use_nvmm;
+
+    // Hardware-trigger correlation state, fed via the "notify-trigger" action signal and consumed
+    // in gst_vmbsrc_create. Access is serialized by lock because triggers are pushed from an
+    // external thread while frames are processed on the streaming thread.
+    struct
+    {
+        GMutex lock;
+        GstVmbSrcTriggerEvent *events; // ring buffer of pending trigger events (oldest at head)
+        guint capacity;
+        guint head;
+        guint count;
+        GstClockTime latency_estimate; // adaptive trigger->arrival latency (ns, monotonic domain)
+        gboolean latency_valid;
+        guint64 overflow_count;        // trigger events discarded because the ring was full
+        gboolean any_received;         // latches TRUE on the first trigger event received during an
+                                       // acquisition run; selects which identity space fills the
+                                       // GstReferenceTimestampMeta frame_num (see gst_vmbsrc_create)
+    } trigger;
 };
 
 struct _GstVmbSrcClass
 {
     GstPushSrcClass base_vmbsrc_class;
+
+    // Action signal handler: feed one external hardware-trigger event into the element for frame
+    // correlation. trigger_time_ns is a CLOCK_MONOTONIC timestamp in nanoseconds (same reference
+    // as g_get_monotonic_time()*1000 and the default GStreamer system clock).
+    void (*notify_trigger)(GstVmbSrc *vmbsrc, guint64 trigger_seq, guint64 trigger_time_ns);
 };
 
 GType gst_vmbsrc_get_type(void);

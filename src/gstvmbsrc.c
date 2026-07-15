@@ -54,7 +54,7 @@
 #endif
 
 #if HAVE_DEEPSTREAM
-#include <nvds_latency_meta.h>
+#include <gstnvdsmeta.h>
 #endif
 
 #include <VmbC/VmbC.h>
@@ -92,6 +92,25 @@ static gboolean gst_vmbsrc_stop(GstBaseSrc *src);
 
 static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf);
 
+static void gst_vmbsrc_notify_trigger(GstVmbSrc *vmbsrc, guint64 trigger_seq, guint64 trigger_time_ns);
+static gboolean gst_vmbsrc_correlate_trigger(GstVmbSrc *vmbsrc,
+                                             GstClockTime arrival_monotonic_ns,
+                                             guint64 *out_seq,
+                                             GstClockTime *out_trigger_monotonic_ns,
+                                             GstClockTime *out_latency_ns);
+
+// Number of pending trigger events the element buffers while waiting for the matching frames to
+// be delivered. With correct correlation only about one in-flight trigger is expected (two at
+// most); the ring is kept just large enough to absorb that, and logs a warning if it overflows.
+#define GST_VMBSRC_TRIGGER_RING_CAPACITY 4
+
+enum
+{
+    SIGNAL_NOTIFY_TRIGGER,
+    LAST_SIGNAL
+};
+static guint gst_vmbsrc_signals[LAST_SIGNAL] = {0};
+
 enum
 {
     PROP_0,
@@ -112,7 +131,10 @@ enum
     PROP_TRIGGERACTIVATION,
     PROP_INCOMPLETE_FRAME_HANDLING,
     PROP_ALLOCATION_MODE,
-    PROP_NUM_FRAME_BUFFERS
+    PROP_NUM_FRAME_BUFFERS,
+    PROP_TRIGGERLATENCY,
+    PROP_TRIGGERLATENCYTOLERANCE,
+    PROP_TRIGGERLATENCYMETA
 };
 
 /* pad templates */
@@ -551,6 +573,69 @@ static void gst_vmbsrc_class_init(GstVmbSrcClass *klass)
             G_MAXINT,
             5,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_TRIGGERLATENCY,
+        g_param_spec_uint64(
+            "triggerlatency",
+            "Nominal trigger-to-arrival latency",
+            "Approximate time (in microseconds) between an external hardware trigger firing and the "
+            "corresponding frame arriving in this element. Used to correlate delivered frames with "
+            "the trigger events fed in via the \"notify-trigger\" signal. Providing a good estimate "
+            "makes correlation correct from the first frame; the value is refined at runtime. Set to "
+            "0 to let the element estimate it purely from the data.",
+            0,
+            G_MAXUINT64,
+            0,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_TRIGGERLATENCYTOLERANCE,
+        g_param_spec_uint64(
+            "triggerlatencytolerance",
+            "Trigger match tolerance",
+            "Half-width (in microseconds) of the acceptance window around the expected trigger time. "
+            "A frame is correlated to a trigger only if that trigger lies within this window; "
+            "otherwise the frame is marked uncorrelated. Set to 0 to always accept the nearest "
+            "trigger regardless of distance.",
+            0,
+            G_MAXUINT64,
+            0,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_TRIGGERLATENCYMETA,
+        g_param_spec_boolean(
+            "triggerlatencymeta",
+            "Emit DeepStream trigger latency meta",
+            "When TRUE, attach a GstReferenceTimestampMeta describing the trigger->source interval "
+            "so DeepStream's latency measurement (NVDS_ENABLE_LATENCY_MEASUREMENT) is anchored at the "
+            "trigger instant. Frames without a correlated trigger (e.g. when notify-trigger is not "
+            "used at all) fall back to the frame arrival time as the anchor. Only takes effect with "
+            "the new nvstreammux; harmless otherwise.",
+            TRUE,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    /* Action signal used by an external thread (e.g. the GPIO trigger generator) to hand a trigger
+     * event - a sequence number and a CLOCK_MONOTONIC timestamp in nanoseconds - to the element:
+     *   g_signal_emit_by_name(vmbsrc, "notify-trigger", (guint64)seq, (guint64)time_ns); */
+    klass->notify_trigger = gst_vmbsrc_notify_trigger;
+    gst_vmbsrc_signals[SIGNAL_NOTIFY_TRIGGER] = g_signal_new(
+        "notify-trigger",
+        G_TYPE_FROM_CLASS(klass),
+        G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+        G_STRUCT_OFFSET(GstVmbSrcClass, notify_trigger),
+        NULL,
+        NULL,
+        NULL, /* use the generic (libffi) marshaller */
+        G_TYPE_NONE,
+        2,
+        G_TYPE_UINT64,
+        G_TYPE_UINT64);
+
+    // Force registration of the trigger custom meta now so gst_buffer_add_custom_meta() can find
+    // it by name in create(). Idempotent and thread-safe.
+    gst_vmbsrc_trigger_meta_get_info();
 }
 
 static void gst_vmbsrc_init(GstVmbSrc *vmbsrc)
@@ -693,6 +778,32 @@ static void gst_vmbsrc_init(GstVmbSrc *vmbsrc)
             g_object_class_find_property(
                 gobject_class,
                 "framebuffers")));
+    vmbsrc->properties.trigger_latency = g_value_get_uint64(
+        g_param_spec_get_default_value(
+            g_object_class_find_property(
+                gobject_class,
+                "triggerlatency")));
+    vmbsrc->properties.trigger_latency_tolerance = g_value_get_uint64(
+        g_param_spec_get_default_value(
+            g_object_class_find_property(
+                gobject_class,
+                "triggerlatencytolerance")));
+    vmbsrc->properties.emit_trigger_latency_meta = g_value_get_boolean(
+        g_param_spec_get_default_value(
+            g_object_class_find_property(
+                gobject_class,
+                "triggerlatencymeta")));
+
+    // Set up the hardware-trigger correlation state
+    g_mutex_init(&vmbsrc->trigger.lock);
+    vmbsrc->trigger.capacity = GST_VMBSRC_TRIGGER_RING_CAPACITY;
+    vmbsrc->trigger.events = g_new0(GstVmbSrcTriggerEvent, vmbsrc->trigger.capacity);
+    vmbsrc->trigger.head = 0;
+    vmbsrc->trigger.count = 0;
+    vmbsrc->trigger.latency_estimate = 0;
+    vmbsrc->trigger.latency_valid = FALSE;
+    vmbsrc->trigger.overflow_count = 0;
+    vmbsrc->trigger.any_received = FALSE;
 
     gst_video_info_init(&vmbsrc->video_info);
 }
@@ -770,6 +881,15 @@ void gst_vmbsrc_set_property(GObject *object, guint property_id, const GValue *v
         break;
     case PROP_NUM_FRAME_BUFFERS:
         vmbsrc->num_frame_buffers = g_value_get_int(value);
+        break;
+    case PROP_TRIGGERLATENCY:
+        vmbsrc->properties.trigger_latency = g_value_get_uint64(value);
+        break;
+    case PROP_TRIGGERLATENCYTOLERANCE:
+        vmbsrc->properties.trigger_latency_tolerance = g_value_get_uint64(value);
+        break;
+    case PROP_TRIGGERLATENCYMETA:
+        vmbsrc->properties.emit_trigger_latency_meta = g_value_get_boolean(value);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
@@ -1055,6 +1175,15 @@ void gst_vmbsrc_get_property(GObject *object, guint property_id, GValue *value, 
     case PROP_NUM_FRAME_BUFFERS:
         g_value_set_int(value, vmbsrc->num_frame_buffers);
         break;
+    case PROP_TRIGGERLATENCY:
+        g_value_set_uint64(value, vmbsrc->properties.trigger_latency);
+        break;
+    case PROP_TRIGGERLATENCYTOLERANCE:
+        g_value_set_uint64(value, vmbsrc->properties.trigger_latency_tolerance);
+        break;
+    case PROP_TRIGGERLATENCYMETA:
+        g_value_set_boolean(value, vmbsrc->properties.emit_trigger_latency_meta);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
         break;
@@ -1095,6 +1224,10 @@ void gst_vmbsrc_finalize(GObject *object)
         GST_DEBUG_OBJECT(vmbsrc, "VmbShutdown not called. Current open count: %u", vmb_open_count);
     }
     G_UNLOCK(vmb_open_count);
+
+    g_free(vmbsrc->trigger.events);
+    vmbsrc->trigger.events = NULL;
+    g_mutex_clear(&vmbsrc->trigger.lock);
 
     G_OBJECT_CLASS(gst_vmbsrc_parent_class)->finalize(object);
 }
@@ -1316,6 +1449,16 @@ static gboolean gst_vmbsrc_start(GstBaseSrc *src)
     // Prepare queue for filled frames from which vmbsrc_create can take them
     vmbsrc->filled_frame_queue = g_async_queue_new();
 
+    // Reset hardware-trigger correlation state for this acquisition run
+    g_mutex_lock(&vmbsrc->trigger.lock);
+    vmbsrc->trigger.head = 0;
+    vmbsrc->trigger.count = 0;
+    vmbsrc->trigger.latency_estimate = 0;
+    vmbsrc->trigger.latency_valid = FALSE;
+    vmbsrc->trigger.overflow_count = 0;
+    vmbsrc->trigger.any_received = FALSE;
+    g_mutex_unlock(&vmbsrc->trigger.lock);
+
     if (vmbsrc->frame_buffers == NULL)
     {
         vmbsrc->frame_buffers = calloc(vmbsrc->num_frame_buffers, sizeof *vmbsrc->frame_buffers);
@@ -1455,6 +1598,79 @@ static GstBuffer* gst_vmbsrc_frame_to_buffer(GstVmbSrc *vmbsrc, VmbFrame_t *fram
         &glib_destroy_callback );
 }
 
+#if HAVE_DEEPSTREAM
+// Payload carried into DeepStream. nvstreammux drops plain custom GstMeta (which is why the
+// GstVmbSrcTriggerMeta needs a bridging probe), but it *does* transform an NvDsMeta attached
+// upstream into an NvDsUserMeta on the matching NvDsFrameMeta - so a DeepStream consumer reads
+// these fields straight off the frame, correctly paired per source, without any probe. See the
+// "Bridging the meta into DeepStream frame metadata" section of EXAMPLES.md.
+// Mirrors the fields of GstVmbSrcTriggerMeta so a DeepStream consumer sees the same record a
+// pure-GStreamer consumer does.
+typedef struct
+{
+    guint64 trigger_seq;       // sequence number supplied by the external trigger
+    guint64 trigger_time;      // raw CLOCK_MONOTONIC trigger instant (ns), or GST_CLOCK_TIME_NONE
+    guint64 approx_latency;    // arrival-minus-trigger latency (ns), or GST_CLOCK_TIME_NONE
+    guint64 camera_frame_id;   // VmbFrame_t.frameID
+    guint64 camera_timestamp;  // VmbFrame_t.timestamp (raw camera clock ticks)
+    gboolean correlated;       // TRUE if a matching trigger was found
+} GstVmbSrcNvDsTriggerMeta;
+
+// nvds_get_user_meta_type() maps a string to a process-stable user-meta type id. A DeepStream
+// consumer computes the same id from the same string to identify the frame's NvDsUserMeta.
+#define GST_VMBSRC_NVDS_TRIGGER_META_NAME "VMBSRC.TRIGGER.USERMETA"
+
+static guint gst_vmbsrc_nvds_trigger_meta_type(void)
+{
+    static gsize once = 0;
+    static guint meta_type = 0;
+    if (g_once_init_enter(&once))
+    {
+        meta_type = nvds_get_user_meta_type((gchar *)GST_VMBSRC_NVDS_TRIGGER_META_NAME);
+        g_once_init_leave(&once, 1);
+    }
+    return meta_type;
+}
+
+// Copy/release of the payload while it rides on the source buffer (GstMeta level).
+static gpointer gst_vmbsrc_nvds_meta_copy(gpointer data, gpointer user_data)
+{
+    (void)user_data;
+    GstVmbSrcNvDsTriggerMeta *copy = g_new(GstVmbSrcNvDsTriggerMeta, 1);
+    *copy = *(GstVmbSrcNvDsTriggerMeta *)data;
+    return copy;
+}
+
+static void gst_vmbsrc_nvds_meta_release(gpointer data, gpointer user_data)
+{
+    (void)user_data;
+    g_free(data);
+}
+
+// Called by nvstreammux to transform the buffer-level payload into the frame's NvDsUserMeta:
+// "data" is the NvDsUserMeta, its user_meta_data is our buffer-level payload. Return a fresh heap
+// copy that the frame meta takes ownership of (freed via the release func below).
+static gpointer gst_vmbsrc_nvds_meta_transform(gpointer data, gpointer user_data)
+{
+    (void)user_data;
+    NvDsUserMeta *user_meta = (NvDsUserMeta *)data;
+    GstVmbSrcNvDsTriggerMeta *copy = g_new(GstVmbSrcNvDsTriggerMeta, 1);
+    *copy = *(GstVmbSrcNvDsTriggerMeta *)user_meta->user_meta_data;
+    return copy;
+}
+
+static void gst_vmbsrc_nvds_meta_transform_release(gpointer data, gpointer user_data)
+{
+    (void)user_data;
+    NvDsUserMeta *user_meta = (NvDsUserMeta *)data;
+    if (user_meta != NULL && user_meta->user_meta_data != NULL)
+    {
+        g_free(user_meta->user_meta_data);
+        user_meta->user_meta_data = NULL;
+    }
+}
+#endif // HAVE_DEEPSTREAM
+
 /* ask the subclass to create a buffer */
 static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
 {
@@ -1516,40 +1732,162 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
     // from the camera.
     GstBuffer* buffer = gst_vmbsrc_frame_to_buffer(vmbsrc, frame);
 
-    // Timestamp the buffer with the running-time at which the frame actually arrived from the
-    // camera (recorded in vimbax_frame_callback), NOT the time create() dequeues it. Frames may
-    // sit in filled_frame_queue before create() picks them up; stamping at dequeue time would
-    // hide that queue residency and inject jitter, which corrupts downstream latency measurements
-    // (e.g. DeepStream frame/inference latency).
+    // Arrival time recorded in vimbax_frame_callback (CLOCK_MONOTONIC nanoseconds). Using this,
+    // NOT the time create() dequeues the frame, avoids hiding the time a frame spent waiting in
+    // filled_frame_queue (which would corrupt latency analysis).
+    gint64 arrival_monotonic_us = (gint64)(guintptr)frame->context[3];
+    GstClockTime arrival_monotonic_ns =
+        (arrival_monotonic_us > 0) ? ((GstClockTime)arrival_monotonic_us * GST_USECOND) : GST_CLOCK_TIME_NONE;
+
+    // Try to correlate this frame with an external hardware-trigger event (fed via notify-trigger).
+    guint64 trigger_seq = 0;
+    GstClockTime trigger_monotonic_ns = GST_CLOCK_TIME_NONE;
+    GstClockTime approx_latency_ns = GST_CLOCK_TIME_NONE;
+    gboolean correlated = FALSE;
+    if (arrival_monotonic_ns != GST_CLOCK_TIME_NONE)
+    {
+        correlated = gst_vmbsrc_correlate_trigger(vmbsrc, arrival_monotonic_ns,
+                                                  &trigger_seq, &trigger_monotonic_ns, &approx_latency_ns);
+    }
+
+    // Timestamp the buffer with the instant its originating event happened: the correlated trigger
+    // time when available (the most meaningful anchor for latency analysis and for pairing the
+    // image with external data), otherwise the frame arrival time. In both cases we map a past
+    // CLOCK_MONOTONIC instant into pipeline running-time using only the elapsed monotonic delta,
+    // which stays correct for whatever clock the pipeline selected as long as it advances in real
+    // time: running_time(t) = now_running_time - (now_monotonic - t).
     GstClock *clock = gst_element_get_clock(GST_ELEMENT(vmbsrc));
     GstClockTime pts = GST_CLOCK_TIME_NONE;
+    GstClockTime trigger_running_time = GST_CLOCK_TIME_NONE;
     if (clock)
     {
         GstClockTime now = gst_clock_get_time(clock);
+        GstClockTime now_monotonic_ns = (GstClockTime)g_get_monotonic_time()*1000;
         GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(vmbsrc));
-        g_object_unref(clock);
-
-        // Current running-time of the pipeline
         GstClockTime now_running_time = (now >= base_time) ? (now - base_time) : 0;
 
-        // Determine how long ago the frame arrived using the elapsed monotonic delta. Only the
-        // delta is used (not the absolute monotonic value), so this stays correct for whatever
-        // clock the pipeline selected, as long as it advances in real time.
-        gint64 arrival_monotonic_us = (gint64)(guintptr)frame->context[3];
-        if (arrival_monotonic_us > 0)
+        // The trigger/arrival instants are CLOCK_MONOTONIC; the buffer PTS must be pipeline
+        // running-time. GStreamer's default clock (GstSystemClock, GST_CLOCK_TYPE_MONOTONIC) IS
+        // g_get_monotonic_time(), so its epoch matches those instants and the two reads of "now"
+        // above measure the same physical clock - making the delta bridge below redundant and,
+        // worse, saddling the result with the microsecond resolution of g_get_monotonic_time().
+        // Detect that: compare the two "now" readings, and if they agree within 2.5 us (a little
+        // above that microsecond quantisation plus the gap between the two reads) treat the clocks
+        // as identical and convert exactly with a single subtraction of base_time. Otherwise the
+        // pipeline runs a foreign clock (e.g. slaved to PTP/network); keep bridging the domains via
+        // the elapsed monotonic delta measured now, which stays correct for any clock advancing in
+        // real time.
+        GstClockTimeDiff clock_offset = (GstClockTimeDiff)(now - now_monotonic_ns);
+        gboolean clocks_aligned =
+            (clock_offset < 0 ? -clock_offset : clock_offset) < (GstClockTimeDiff)(5 * GST_USECOND / 2);
+
+        if (correlated && trigger_monotonic_ns != GST_CLOCK_TIME_NONE)
         {
-            GstClockTimeDiff age = (g_get_monotonic_time() - arrival_monotonic_us) * GST_USECOND;
-            if (age < 0)
+            if (clocks_aligned)
             {
-                age = 0;
+                trigger_running_time =
+                    (trigger_monotonic_ns > base_time) ? (trigger_monotonic_ns - base_time) : 0;
             }
-            pts = (now_running_time > (GstClockTime)age) ? (now_running_time - (GstClockTime)age) : 0;
+            else
+            {
+                GstClockTimeDiff since = (GstClockTimeDiff)(now_monotonic_ns - trigger_monotonic_ns);
+                if (since < 0)
+                {
+                    since = 0;
+                }
+                trigger_running_time = (now_running_time > (GstClockTime)since) ? (now_running_time - since) : 0;
+            }
+            pts = trigger_running_time;
+        }
+        else if (arrival_monotonic_ns != GST_CLOCK_TIME_NONE)
+        {
+            if (clocks_aligned)
+            {
+                pts = (arrival_monotonic_ns > base_time) ? (arrival_monotonic_ns - base_time) : 0;
+            }
+            else
+            {
+                GstClockTimeDiff age = (GstClockTimeDiff)(now_monotonic_ns - arrival_monotonic_ns);
+                if (age < 0)
+                {
+                    age = 0;
+                }
+                pts = (now_running_time > (GstClockTime)age) ? (now_running_time - age) : 0;
+            }
         }
         else
         {
-            // Arrival time was not recorded for some reason; fall back to the current running-time
+            // Neither trigger nor arrival time available; fall back to the current running-time
             pts = now_running_time;
         }
+
+        // Anchor DeepStream latency measurement at the trigger instant, falling back to the frame
+        // arrival instant for frames without a correlated trigger (in particular when notify-trigger
+        // is not used at all - the meta must still be emitted per frame, otherwise DeepStream's
+        // frame counter freezes and the frame-latency baseline stays 0). The new nvstreammux reads
+        // component in/out timestamps (wall-clock milliseconds) from a GstReferenceTimestampMeta's
+        // caps structure; convert the anchor instant into that domain via the monotonic->realtime
+        // delta measured now. NOTE: units/behaviour follow the new nvstreammux (gst-nvmultistream2)
+        // and should be validated with NVDS_ENABLE_LATENCY_MEASUREMENT for the mux in use.
+        // NOTE: nvds_measure_buffer_latency() only uses a component as the overall frame-latency
+        // baseline (comp_in_timestamp) if its name starts with "nvv4l2decode" or "audiodecoder"
+        // (hardcoded strncmp in libnvdsgst_meta.so). To anchor DeepStream's "Frame latency" at the
+        // trigger instant, name this element accordingly, e.g. "nvv4l2decoder_cam_<ID>"; the meta
+        // below is then emitted as "<element-name>-trigger" and passes that check. This block only
+        // uses core GStreamer API, so it needs no DeepStream SDK at build time and is harmless in
+        // non-DeepStream pipelines.
+        GstClockTime meta_anchor_monotonic_ns = GST_CLOCK_TIME_NONE;
+        GstClockTime meta_anchor_running_time = GST_CLOCK_TIME_NONE;
+        if (correlated && trigger_running_time != GST_CLOCK_TIME_NONE)
+        {
+            meta_anchor_monotonic_ns = trigger_monotonic_ns;
+            meta_anchor_running_time = trigger_running_time;
+        }
+        else if (arrival_monotonic_ns != GST_CLOCK_TIME_NONE)
+        {
+            meta_anchor_monotonic_ns = arrival_monotonic_ns;
+            meta_anchor_running_time = pts;
+        }
+        if (vmbsrc->properties.emit_trigger_latency_meta &&
+            meta_anchor_monotonic_ns != GST_CLOCK_TIME_NONE)
+        {
+            // Choose the frame_num identity carried into DeepStream. Unlike the latency *anchor*
+            // above (which always uses the best timing instant available per frame), frame_num sticks
+            // to a single value space for the whole acquisition run so downstream logs stay
+            // unambiguous - a given frame_num means the same kind of thing every frame:
+            //   - Before any trigger has ever been seen, triggering may not be in use at all and no
+            //     trigger sequence exists; use the monotonic delivered-frame counter, a collision-
+            //     free per-frame index.
+            //   - Once any trigger has arrived (latched in trigger.any_received), commit to the
+            //     trigger-sequence space for the rest of the run and never fall back. trigger_seq is
+            //     the cross-camera frame identity: cameras fired by the same external trigger report
+            //     the same frame_num, which is what lets two streams be paired by trigger event. A
+            //     frame that then fails to correlate is reported as 0 - a deliberate, obvious "this
+            //     should not happen" break in the logs, rather than a delivered-counter value that
+            //     would silently collide with the trigger-sequence space and read as a valid frame.
+            gboolean triggers_active;
+            g_mutex_lock(&vmbsrc->trigger.lock);
+            triggers_active = vmbsrc->trigger.any_received;
+            g_mutex_unlock(&vmbsrc->trigger.lock);
+            guint64 meta_frame_num =
+                triggers_active ? (correlated ? trigger_seq : 0) : vmbsrc->num_frames_pushed;
+
+            gdouble now_realtime_ms = (gdouble)g_get_real_time() / 1000.0;
+            gdouble anchor_realtime_ms =
+                now_realtime_ms - (gdouble)(now_monotonic_ns - meta_anchor_monotonic_ns) / (gdouble)GST_MSECOND;
+            gchar *component_name = g_strdup_printf("%s-trigger", GST_ELEMENT_NAME(vmbsrc));
+            GstCaps *reference = gst_caps_new_simple(
+                "timestamp/x-vmbsrc-trigger",
+                "component_name", G_TYPE_STRING, component_name,
+                "frame_num", G_TYPE_INT, (gint)meta_frame_num,
+                "in_timestamp", G_TYPE_DOUBLE, anchor_realtime_ms,
+                "out_timestamp", G_TYPE_DOUBLE, now_realtime_ms,
+                NULL);
+            gst_buffer_add_reference_timestamp_meta(buffer, reference, meta_anchor_running_time, GST_CLOCK_TIME_NONE);
+            gst_caps_unref(reference);
+            g_free(component_name);
+        }
+        g_object_unref(clock);
     }
     GST_BUFFER_PTS(buffer) = pts;
     // Framerate is advertised as variable (0/1) because triggering may produce a variable frame
@@ -1579,19 +1917,263 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
     GST_BUFFER_OFFSET(buffer) = vmbsrc->num_frames_pushed;
     GST_BUFFER_OFFSET_END(buffer) = ++(vmbsrc->num_frames_pushed);
 
+    // Attach the vmbsrc trigger metadata to every buffer so downstream (pure GStreamer, or a
+    // DeepStream bridge probe - see EXAMPLES.md) can pair the image with the right external data.
+    // The external trigger sequence number IS the frame identity that stays aligned across dropped
+    // frames/triggers (unlike a delivered-frame counter such as GST_BUFFER_OFFSET or
+    // NvDsFrameMeta.frame_num).
+    GstCustomMeta *trigger_meta = gst_buffer_add_custom_meta(buffer, GST_VMBSRC_TRIGGER_META_NAME);
+    if (trigger_meta != NULL)
+    {
+        // Store the fields in the custom meta's GstStructure. GstClockTime is guint64, so
+        // GST_CLOCK_TIME_NONE round-trips as a plain uint64; keys match the accessor above.
+        gst_structure_set(gst_custom_meta_get_structure(trigger_meta),
+                          "trigger-seq", G_TYPE_UINT64, (guint64)trigger_seq,
+                          // Propagate the raw CLOCK_MONOTONIC trigger instant exactly as fed into
+                          // notify-trigger (this custom meta is our own payload, opaque to
+                          // GStreamer; the running-time conversion lives in the buffer PTS instead).
+                          "trigger-time", G_TYPE_UINT64,
+                          (guint64)(correlated ? trigger_monotonic_ns : GST_CLOCK_TIME_NONE),
+                          "approx-latency", G_TYPE_UINT64, (guint64)approx_latency_ns,
+                          "camera-frame-id", G_TYPE_UINT64, (guint64)frame->frameID,
+                          "camera-timestamp", G_TYPE_UINT64, (guint64)frame->timestamp,
+                          "correlated", G_TYPE_BOOLEAN, correlated,
+                          NULL);
+    }
+
 #if HAVE_DEEPSTREAM
-    // Mark this element as the origin of the pipeline for DeepStream latency measurement. This
-    // attaches an input-system-timestamp meta so that, when NVDS_ENABLE_LATENCY_MEASUREMENT is
-    // set, DeepStream measures frame/component latency starting from this source rather than from
-    // the first NVIDIA element downstream. The call is a no-op when latency measurement is
-    // disabled, matching how the stock DeepStream elements use it.
-    nvds_set_input_system_timestamp(buffer, GST_ELEMENT_NAME(vmbsrc));
-#endif
+    // Additionally attach the record as a DeepStream NvDsMeta. Unlike the custom GstMeta above
+    // (dropped by nvstreammux), this is transformed by nvstreammux into an NvDsUserMeta on the
+    // matching NvDsFrameMeta, so a DeepStream consumer reads it off the frame with no bridging
+    // probe (see EXAMPLES.md). Compiled in only when the DeepStream SDK was found at build time.
+    {
+        GstVmbSrcNvDsTriggerMeta *payload = g_new(GstVmbSrcNvDsTriggerMeta, 1);
+        payload->trigger_seq = (guint64)trigger_seq;
+        payload->trigger_time = (guint64)(correlated ? trigger_monotonic_ns : GST_CLOCK_TIME_NONE);
+        payload->approx_latency = (guint64)approx_latency_ns;
+        payload->camera_frame_id = (guint64)frame->frameID;
+        payload->camera_timestamp = (guint64)frame->timestamp;
+        payload->correlated = correlated;
+        NvDsMeta *nvds_meta = gst_buffer_add_nvds_meta(buffer, payload, NULL,
+                                                       gst_vmbsrc_nvds_meta_copy,
+                                                       gst_vmbsrc_nvds_meta_release);
+        if (nvds_meta != NULL)
+        {
+            // nvstreammux copies meta_data to NvDsFrameMeta user meta via the transform func, and
+            // tags the resulting NvDsUserMeta->base_meta.meta_type with this meta_type.
+            nvds_meta->meta_type = (gint)gst_vmbsrc_nvds_trigger_meta_type();
+            nvds_meta->gst_to_nvds_meta_transform_func = gst_vmbsrc_nvds_meta_transform;
+            nvds_meta->gst_to_nvds_meta_release_func = gst_vmbsrc_nvds_meta_transform_release;
+        }
+        else
+        {
+            // add failed: no meta took ownership, so free our payload to avoid a leak.
+            g_free(payload);
+        }
+    }
+#endif // HAVE_DEEPSTREAM
 
     // Set filled GstBuffer as output to pass down the pipeline
     *buf = buffer;
 
     return GST_FLOW_OK;
+}
+
+/* -- GstVmbSrcTriggerMeta implementation -------------------------------------------------------- */
+
+// Copy one GstStructure field into another; used to carry the meta across buffer copies.
+static gboolean gst_vmbsrc_trigger_meta_copy_field(GQuark field_id, const GValue *value, gpointer user_data)
+{
+    GstStructure *dst = (GstStructure *)user_data;
+    gst_structure_id_set_value(dst, field_id, value);
+    return TRUE;
+}
+
+static gboolean gst_vmbsrc_trigger_meta_transform(GstBuffer *dest, GstCustomMeta *meta, GstBuffer *buffer,
+                                                  GQuark type, gpointer data, gpointer user_data)
+{
+    UNUSED(buffer);
+    UNUSED(data);
+    UNUSED(user_data);
+    // Carry the metadata across buffer copies unchanged. It is not tied to the pixel data, so it
+    // survives any copy transform; other transforms (e.g. scaling) simply don't apply to it.
+    if (GST_META_TRANSFORM_IS_COPY(type))
+    {
+        GstCustomMeta *dst = gst_buffer_add_custom_meta(dest, GST_VMBSRC_TRIGGER_META_NAME);
+        if (dst == NULL)
+        {
+            return FALSE;
+        }
+        gst_structure_foreach(gst_custom_meta_get_structure(meta),
+                              gst_vmbsrc_trigger_meta_copy_field,
+                              gst_custom_meta_get_structure(dst));
+    }
+    return TRUE;
+}
+
+const GstMetaInfo *gst_vmbsrc_trigger_meta_get_info(void)
+{
+    static gsize info = 0;
+    if (g_once_init_enter(&info))
+    {
+        // Registered as a GstCustomMeta (GStreamer >= 1.20) so the fields, stored in a
+        // GstStructure, are introspectable from Python via gst_buffer_get_custom_meta().
+        static const gchar *tags[] = {NULL};
+        const GstMetaInfo *mi = gst_meta_register_custom(GST_VMBSRC_TRIGGER_META_NAME,
+                                                         tags,
+                                                         gst_vmbsrc_trigger_meta_transform,
+                                                         NULL,  /* user_data */
+                                                         NULL); /* destroy_data */
+        g_once_init_leave(&info, (gsize)mi);
+    }
+    return (const GstMetaInfo *)info;
+}
+
+gboolean gst_buffer_get_vmbsrc_trigger_meta(GstBuffer *buffer, GstVmbSrcTriggerMeta *out)
+{
+    GstCustomMeta *cmeta = gst_buffer_get_custom_meta(buffer, GST_VMBSRC_TRIGGER_META_NAME);
+    if (cmeta == NULL)
+    {
+        return FALSE;
+    }
+    const GstStructure *s = gst_custom_meta_get_structure(cmeta);
+    // GstClockTime/guint64 fields are stored as G_TYPE_UINT64; correlated as G_TYPE_BOOLEAN.
+    // Absent keys leave the corresponding out-field at the initialized default.
+    out->trigger_seq = 0;
+    out->trigger_time = GST_CLOCK_TIME_NONE;
+    out->approx_latency = GST_CLOCK_TIME_NONE;
+    out->camera_frame_id = 0;
+    out->camera_timestamp = 0;
+    out->correlated = FALSE;
+    gst_structure_get_uint64(s, "trigger-seq", &out->trigger_seq);
+    gst_structure_get_uint64(s, "trigger-time", &out->trigger_time);
+    gst_structure_get_uint64(s, "approx-latency", &out->approx_latency);
+    gst_structure_get_uint64(s, "camera-frame-id", &out->camera_frame_id);
+    gst_structure_get_uint64(s, "camera-timestamp", &out->camera_timestamp);
+    gst_structure_get_boolean(s, "correlated", &out->correlated);
+    return TRUE;
+}
+
+/* -- Hardware-trigger correlation --------------------------------------------------------------- */
+
+// Action signal handler. Called from the external trigger thread to hand a trigger event to the
+// element. Pushes it onto the ring buffer for gst_vmbsrc_correlate_trigger to consume.
+static void gst_vmbsrc_notify_trigger(GstVmbSrc *vmbsrc, guint64 trigger_seq, guint64 trigger_time_ns)
+{
+    g_mutex_lock(&vmbsrc->trigger.lock);
+    if (vmbsrc->trigger.count == vmbsrc->trigger.capacity)
+    {
+        // Ring full: drop the oldest pending trigger to make room. This indicates frames are not
+        // being consumed fast enough relative to the trigger rate, or correlation is failing.
+        vmbsrc->trigger.head = (vmbsrc->trigger.head + 1) % vmbsrc->trigger.capacity;
+        vmbsrc->trigger.count--;
+        vmbsrc->trigger.overflow_count++;
+        GST_WARNING_OBJECT(vmbsrc,
+                           "Trigger ring buffer full; dropping oldest pending trigger event "
+                           "(total dropped: %" G_GUINT64_FORMAT ")",
+                           vmbsrc->trigger.overflow_count);
+    }
+    guint tail = (vmbsrc->trigger.head + vmbsrc->trigger.count) % vmbsrc->trigger.capacity;
+    vmbsrc->trigger.events[tail].seq = trigger_seq;
+    vmbsrc->trigger.events[tail].monotonic_time = (GstClockTime)trigger_time_ns;
+    vmbsrc->trigger.count++;
+    // Latch that triggering is in use for this run; from here on frame_num is drawn from the
+    // trigger-sequence space (see gst_vmbsrc_create), never again from the delivered-frame counter.
+    vmbsrc->trigger.any_received = TRUE;
+    g_mutex_unlock(&vmbsrc->trigger.lock);
+
+    GST_TRACE_OBJECT(vmbsrc, "Received trigger event seq=%" G_GUINT64_FORMAT " time=%" G_GUINT64_FORMAT " ns",
+                     trigger_seq, trigger_time_ns);
+}
+
+// Match a delivered frame (identified by its CLOCK_MONOTONIC arrival time) to the trigger event
+// that most likely produced it, using timestamp proximity. Robust to dropped frames/over-triggers:
+// the expected trigger instant is arrival minus the (nominal or adaptively estimated) latency, and
+// the nearest pending trigger to that instant is chosen; any older, unmatched triggers are then
+// discarded because they produced no delivered frame. Returns TRUE and fills the out-parameters
+// when a match within tolerance is found. Must be called with vmbsrc->trigger.lock NOT held.
+static gboolean gst_vmbsrc_correlate_trigger(GstVmbSrc *vmbsrc,
+                                             GstClockTime arrival_monotonic_ns,
+                                             guint64 *out_seq,
+                                             GstClockTime *out_trigger_monotonic_ns,
+                                             GstClockTime *out_latency_ns)
+{
+    gboolean correlated = FALSE;
+    g_mutex_lock(&vmbsrc->trigger.lock);
+
+    if (vmbsrc->trigger.count > 0)
+    {
+        // Expected trigger latency: the adaptive estimate once we have one, otherwise the
+        // configured nominal value, otherwise zero (pick the trigger nearest to arrival itself).
+        GstClockTime latency = vmbsrc->trigger.latency_valid
+                                   ? vmbsrc->trigger.latency_estimate
+                                   : (GstClockTime)vmbsrc->properties.trigger_latency * GST_USECOND;
+        GstClockTime target = (arrival_monotonic_ns > latency) ? (arrival_monotonic_ns - latency) : 0;
+
+        // Find the pending trigger whose timestamp is closest to the expected instant
+        guint best_offset = 0;
+        GstClockTime best_diff = G_MAXUINT64;
+        for (guint i = 0; i < vmbsrc->trigger.count; i++)
+        {
+            guint idx = (vmbsrc->trigger.head + i) % vmbsrc->trigger.capacity;
+            GstClockTime t = vmbsrc->trigger.events[idx].monotonic_time;
+            GstClockTime diff = (t > target) ? (t - target) : (target - t);
+            if (diff < best_diff)
+            {
+                best_diff = diff;
+                best_offset = i;
+            }
+        }
+
+        GstClockTime tolerance = (GstClockTime)vmbsrc->properties.trigger_latency_tolerance * GST_USECOND;
+        if (tolerance == 0 || best_diff <= tolerance)
+        {
+            guint best_idx = (vmbsrc->trigger.head + best_offset) % vmbsrc->trigger.capacity;
+            GstClockTime matched_time = vmbsrc->trigger.events[best_idx].monotonic_time;
+            guint64 matched_seq = vmbsrc->trigger.events[best_idx].seq;
+            GstClockTime observed =
+                (arrival_monotonic_ns > matched_time) ? (arrival_monotonic_ns - matched_time) : 0;
+
+            if (best_offset > 0)
+            {
+                GST_DEBUG_OBJECT(vmbsrc,
+                                 "Discarding %u older trigger event(s) with no matching frame "
+                                 "(dropped frames / over-trigger)",
+                                 best_offset);
+            }
+
+            // Consume the matched trigger and all older ones
+            guint consumed = best_offset + 1;
+            vmbsrc->trigger.head = (vmbsrc->trigger.head + consumed) % vmbsrc->trigger.capacity;
+            vmbsrc->trigger.count -= consumed;
+
+            // Refine the adaptive latency estimate (exponential moving average)
+            if (vmbsrc->trigger.latency_valid)
+            {
+                vmbsrc->trigger.latency_estimate = (vmbsrc->trigger.latency_estimate * 7 + observed) / 8;
+            }
+            else
+            {
+                vmbsrc->trigger.latency_estimate = observed;
+                vmbsrc->trigger.latency_valid = TRUE;
+            }
+
+            *out_seq = matched_seq;
+            *out_trigger_monotonic_ns = matched_time;
+            *out_latency_ns = observed;
+            correlated = TRUE;
+        }
+        else
+        {
+            GST_DEBUG_OBJECT(vmbsrc,
+                             "No trigger within tolerance for frame (nearest off by %" G_GUINT64_FORMAT
+                             " ns); leaving frame uncorrelated",
+                             best_diff);
+        }
+    }
+
+    g_mutex_unlock(&vmbsrc->trigger.lock);
+    return correlated;
 }
 
 static gboolean plugin_init(GstPlugin *plugin)

@@ -193,6 +193,14 @@ typedef struct _GstVmbSrcTriggerMeta
     guint64 camera_frame_id;     // "camera-frame-id": VmbFrame_t.frameID as reported by the camera
     guint64 camera_timestamp;    // "camera-timestamp": VmbFrame_t.timestamp (raw camera clock ticks)
     gboolean correlated;         // "correlated": TRUE if a matching trigger event was found
+    const gchar *camera_serial;  // "camera-serial": camera serial number (VmbCameraInfo_t.serialString),
+                                 // or NULL if the camera has not been opened. Owned by the buffer's
+                                 // meta; valid only while the buffer is alive - copy to retain it.
+    const gchar *camera_name;    // "camera-name": user-supplied logical camera name (the "cameraname"
+                                 // property), or NULL. Owned by the buffer's meta (see camera_serial).
+    gint camera_index;           // "camera-index": user-supplied logical camera index (the
+                                 // "cameraindex" property), or G_MAXINT if unset. Any int (incl. 0
+                                 // and -1) is a valid set value.
 } GstVmbSrcTriggerMeta;
 
 // Registers the custom meta (idempotent, thread-safe). Called during element class init so that
@@ -240,6 +248,8 @@ struct _GstVmbSrc
         guint64 trigger_latency;            // nominal trigger->arrival latency in microseconds (0 = adaptive)
         guint64 trigger_latency_tolerance;  // match acceptance half-window in microseconds (0 = accept nearest)
         gboolean emit_trigger_latency_meta; // attach GstReferenceTimestampMeta for DeepStream latency
+        char *camera_name;                  // user-supplied logical camera name carried in the frame meta
+        int camera_index;                   // user-supplied logical camera index carried in the frame meta (G_MAXINT = unset)
     } properties;
 
     int num_frame_buffers;

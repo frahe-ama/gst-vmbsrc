@@ -278,12 +278,16 @@ frame uncorrelated when no trigger falls within the window.
   | `camera_frame_id`  | `camera-frame-id`  | `VmbFrame_t.frameID` reported by the camera                    |
   | `camera_timestamp` | `camera-timestamp` | `VmbFrame_t.timestamp` (raw camera clock ticks)                |
   | `correlated`       | `correlated`       | `TRUE` if a matching trigger was found                         |
+  | `camera_serial`    | `camera-serial`    | camera serial number (`VmbCameraInfo_t.serialString`), or `""` if the camera is not open |
+  | `camera_name`      | `camera-name`      | application-defined camera name from the `cameraname` property, or `""` |
+  | `camera_index`     | `camera-index`     | application-defined camera index from the `cameraindex` property (`gint`; any value valid, `G_MAXINT` = unset) |
 
 - **`GstReferenceTimestampMeta`** (when `triggerlatencymeta=true`, the default): anchors DeepStream
   latency measurement at the trigger instant. See the note at the end.
-- **DeepStream `NvDsMeta`** (only when `vmbsrc` was built with the DeepStream SDK): carries
-  `trigger_seq`, `trigger_time`, `camera_frame_id` and `correlated` in a form `nvstreammux` copies
-  onto `NvDsFrameMeta` without a probe — see [Bridging the meta into DeepStream frame
+- **DeepStream `NvDsMeta`** (only when `vmbsrc` was built with the DeepStream SDK): carries the same
+  record as `GstVmbSrcTriggerMeta` — including `camera_serial`, `camera_name` and `camera_index` — in
+  a form `nvstreammux` copies onto `NvDsFrameMeta` without a probe. String fields are fixed-capacity
+  (`char[64]`) so the payload stays a flat POD; see [Bridging the meta into DeepStream frame
   metadata](#bridging-the-meta-into-deepstream-frame-metadata).
 
 ### Buffer PTS: trigger vs. no-trigger cases
@@ -340,7 +344,9 @@ static GstPadProbeReturn read_trigger_meta(GstPad *pad, GstPadProbeInfo *info, g
 
 From **Python**, no custom bindings are needed — read the custom meta's `GstStructure` directly.
 The fields use dashed keys (`trigger-seq`, `trigger-time`, `approx-latency`, `camera-frame-id`,
-`camera-timestamp`, `correlated`) and every numeric field of the custom meta is a `guint64`.
+`camera-timestamp`, `correlated`, `camera-serial`, `camera-name`, `camera-index`). Every numeric
+field is a `guint64` except `camera-index` (a `gint`); `camera-serial`/`camera-name` are strings
+(`s.get_string("camera-serial")`).
 
 Two related values live **outside** the custom meta:
 
@@ -433,8 +439,9 @@ muxer), **but** it does transform an `NvDsMeta` attached upstream into an `NvDsU
 matching `NvDsFrameMeta`. When `vmbsrc` is built with the DeepStream SDK present (the CMake build
 finds it and defines `HAVE_DEEPSTREAM`), it attaches exactly such an `NvDsMeta` to every buffer, so
 **no bridging probe is needed** — the muxer copies the record onto the right frame for you, correctly
-paired per source. The payload carries `trigger_seq`, `trigger_time`, `camera_frame_id` and
-`correlated`.
+paired per source. The payload carries the full record: `trigger_seq`, `trigger_time`,
+`approx_latency`, `camera_frame_id`, `camera_timestamp`, `correlated`, `camera_index` and the
+fixed-capacity strings `camera_serial` / `camera_name`.
 
 Read it downstream (e.g. on the `pgie`/`nvinfer` src pad, or `nvdsosd` sink pad) by walking
 `frame_user_meta_list` and matching the user-meta type, which both sides derive from the same string
@@ -444,7 +451,8 @@ Read it downstream (e.g. on the `pgie`/`nvinfer` src pad, or `nvdsosd` sink pad)
 #include "gstnvdsmeta.h"
 
 // Must match the payload struct vmbsrc attaches (see gst_vmbsrc_create in gstvmbsrc.c). These are
-// the same fields as GstVmbSrcTriggerMeta.
+// the same fields as GstVmbSrcTriggerMeta. Field order and the string capacity must match exactly.
+#define GST_VMBSRC_NVDS_STRING_MAX 64
 typedef struct {
     guint64 trigger_seq;
     guint64 trigger_time;      // CLOCK_MONOTONIC ns, or GST_CLOCK_TIME_NONE if uncorrelated
@@ -452,6 +460,9 @@ typedef struct {
     guint64 camera_frame_id;
     guint64 camera_timestamp;  // raw camera clock ticks
     gboolean correlated;
+    gint camera_index;         // application-defined index, or G_MAXINT if unset
+    char camera_serial[GST_VMBSRC_NVDS_STRING_MAX]; // camera serial, or "" if unavailable
+    char camera_name[GST_VMBSRC_NVDS_STRING_MAX];   // application-defined name, or ""
 } GstVmbSrcNvDsTriggerMeta;
 
 static GstPadProbeReturn read_frame_trigger(GstPad *pad, GstPadProbeInfo *info, gpointer u)
@@ -467,8 +478,9 @@ static GstPadProbeReturn read_frame_trigger(GstPad *pad, GstPadProbeInfo *info, 
             if (um->base_meta.meta_type == (gint)vmbsrc_type) {
                 GstVmbSrcNvDsTriggerMeta *t = (GstVmbSrcNvDsTriggerMeta *)um->user_meta_data;
                 if (t->correlated)
-                    g_print("source=%u frame trigger_seq=%" G_GUINT64_FORMAT "\n",
-                            fm->pad_index, t->trigger_seq);
+                    g_print("source=%u serial=%s name=%s index=%d trigger_seq=%" G_GUINT64_FORMAT "\n",
+                            fm->pad_index, t->camera_serial, t->camera_name, t->camera_index,
+                            t->trigger_seq);
             }
         }
     }
@@ -483,13 +495,19 @@ import ctypes
 import pyds
 
 
+VMBSRC_NVDS_STRING_MAX = 64
+
+
 class VmbTriggerMeta(ctypes.Structure):
     _fields_ = [("trigger_seq", ctypes.c_uint64),
                 ("trigger_time", ctypes.c_uint64),
                 ("approx_latency", ctypes.c_uint64),
                 ("camera_frame_id", ctypes.c_uint64),
                 ("camera_timestamp", ctypes.c_uint64),
-                ("correlated", ctypes.c_int)]
+                ("correlated", ctypes.c_int),
+                ("camera_index", ctypes.c_int),
+                ("camera_serial", ctypes.c_char * VMBSRC_NVDS_STRING_MAX),
+                ("camera_name", ctypes.c_char * VMBSRC_NVDS_STRING_MAX)]
 
 
 def read_frame_trigger(pad, info, u_data):
@@ -509,7 +527,9 @@ def read_frame_trigger(pad, info, u_data):
                 # trigger_time is CLOCK_MONOTONIC ns, or GST_CLOCK_TIME_NONE (2**64-1) if uncorrelated
                 trigger_time = None if t.trigger_time == Gst.CLOCK_TIME_NONE else t.trigger_time
                 latency = None if t.approx_latency == Gst.CLOCK_TIME_NONE else t.approx_latency
-                print(f"source={frame_meta.pad_index} trigger_seq={t.trigger_seq} "
+                print(f"source={frame_meta.pad_index} "
+                      f"serial={t.camera_serial.decode()} name={t.camera_name.decode()} "
+                      f"index={t.camera_index} trigger_seq={t.trigger_seq} "
                       f"trigger_time={trigger_time} approx_latency={latency} "
                       f"camera_frame_id={t.camera_frame_id} camera_timestamp={t.camera_timestamp} "
                       f"correlated={bool(t.correlated)}")

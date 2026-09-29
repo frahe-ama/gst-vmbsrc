@@ -134,7 +134,9 @@ enum
     PROP_NUM_FRAME_BUFFERS,
     PROP_TRIGGERLATENCY,
     PROP_TRIGGERLATENCYTOLERANCE,
-    PROP_TRIGGERLATENCYMETA
+    PROP_TRIGGERLATENCYMETA,
+    PROP_CAMERANAME,
+    PROP_CAMERAINDEX
 };
 
 /* pad templates */
@@ -615,6 +617,32 @@ static void gst_vmbsrc_class_init(GstVmbSrcClass *klass)
             "the new nvstreammux; harmless otherwise.",
             TRUE,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_CAMERANAME,
+        g_param_spec_string(
+            "cameraname",
+            "Logical camera name",
+            "User-supplied logical name for this camera, carried unchanged in the per-frame metadata "
+            "(the \"camera-name\" field of GstVmbSrcTriggerMeta and the DeepStream payload). This is an "
+            "application-defined label independent of the camera's own reported name; leave empty to "
+            "carry no name.",
+            "",
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(
+        gobject_class,
+        PROP_CAMERAINDEX,
+        g_param_spec_int(
+            "cameraindex",
+            "Logical camera index",
+            "User-supplied logical index for this camera (e.g. mapping this source to a DeepStream "
+            "nvstreammux source-id), carried unchanged in the per-frame metadata (the \"camera-index\" "
+            "field of GstVmbSrcTriggerMeta and the DeepStream payload). Any int value is valid "
+            "(including 0 and -1); leave at the default G_MAXINT to mean unset.",
+            G_MININT,
+            G_MAXINT,
+            G_MAXINT,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
     /* Action signal used by an external thread (e.g. the GPIO trigger generator) to hand a trigger
      * event - a sequence number and a CLOCK_MONOTONIC timestamp in nanoseconds - to the element:
@@ -793,6 +821,16 @@ static void gst_vmbsrc_init(GstVmbSrc *vmbsrc)
             g_object_class_find_property(
                 gobject_class,
                 "triggerlatencymeta")));
+    vmbsrc->properties.camera_name = g_value_dup_string(
+        g_param_spec_get_default_value(
+            g_object_class_find_property(
+                gobject_class,
+                "cameraname")));
+    vmbsrc->properties.camera_index = g_value_get_int(
+        g_param_spec_get_default_value(
+            g_object_class_find_property(
+                gobject_class,
+                "cameraindex")));
 
     // Set up the hardware-trigger correlation state
     g_mutex_init(&vmbsrc->trigger.lock);
@@ -890,6 +928,13 @@ void gst_vmbsrc_set_property(GObject *object, guint property_id, const GValue *v
         break;
     case PROP_TRIGGERLATENCYMETA:
         vmbsrc->properties.emit_trigger_latency_meta = g_value_get_boolean(value);
+        break;
+    case PROP_CAMERANAME:
+        g_free(vmbsrc->properties.camera_name); // free memory of old entry (g_free(NULL) is a no-op)
+        vmbsrc->properties.camera_name = g_value_dup_string(value);
+        break;
+    case PROP_CAMERAINDEX:
+        vmbsrc->properties.camera_index = g_value_get_int(value);
         break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
@@ -1184,6 +1229,12 @@ void gst_vmbsrc_get_property(GObject *object, guint property_id, GValue *value, 
     case PROP_TRIGGERLATENCYMETA:
         g_value_set_boolean(value, vmbsrc->properties.emit_trigger_latency_meta);
         break;
+    case PROP_CAMERANAME:
+        g_value_set_string(value, vmbsrc->properties.camera_name);
+        break;
+    case PROP_CAMERAINDEX:
+        g_value_set_int(value, vmbsrc->properties.camera_index);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
         break;
@@ -1228,6 +1279,9 @@ void gst_vmbsrc_finalize(GObject *object)
     g_free(vmbsrc->trigger.events);
     vmbsrc->trigger.events = NULL;
     g_mutex_clear(&vmbsrc->trigger.lock);
+
+    g_free(vmbsrc->properties.camera_name);
+    vmbsrc->properties.camera_name = NULL;
 
     G_OBJECT_CLASS(gst_vmbsrc_parent_class)->finalize(object);
 }
@@ -1606,6 +1660,9 @@ static GstBuffer* gst_vmbsrc_frame_to_buffer(GstVmbSrc *vmbsrc, VmbFrame_t *fram
 // "Bridging the meta into DeepStream frame metadata" section of EXAMPLES.md.
 // Mirrors the fields of GstVmbSrcTriggerMeta so a DeepStream consumer sees the same record a
 // pure-GStreamer consumer does.
+// Fixed capacity for the string fields so the payload stays a flat POD that can be shallow-copied
+// (see gst_vmbsrc_nvds_meta_copy/transform) without owning heap pointers.
+#define GST_VMBSRC_NVDS_STRING_MAX 64
 typedef struct
 {
     guint64 trigger_seq;       // sequence number supplied by the external trigger
@@ -1614,6 +1671,9 @@ typedef struct
     guint64 camera_frame_id;   // VmbFrame_t.frameID
     guint64 camera_timestamp;  // VmbFrame_t.timestamp (raw camera clock ticks)
     gboolean correlated;       // TRUE if a matching trigger was found
+    gint camera_index;         // user-supplied logical camera index, or G_MAXINT if unset
+    char camera_serial[GST_VMBSRC_NVDS_STRING_MAX]; // camera serial number (empty if unavailable)
+    char camera_name[GST_VMBSRC_NVDS_STRING_MAX];   // user-supplied logical camera name (empty if unset)
 } GstVmbSrcNvDsTriggerMeta;
 
 // nvds_get_user_meta_type() maps a string to a process-stable user-meta type id. A DeepStream
@@ -1938,6 +1998,15 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
                           "camera-frame-id", G_TYPE_UINT64, (guint64)frame->frameID,
                           "camera-timestamp", G_TYPE_UINT64, (guint64)frame->timestamp,
                           "correlated", G_TYPE_BOOLEAN, correlated,
+                          // Static per-camera identity carried alongside the trigger fields so a
+                          // downstream consumer can attribute each frame to its source. The serial
+                          // comes from the camera itself; name/index are application-defined labels
+                          // set via the "cameraname"/"cameraindex" properties.
+                          "camera-serial", G_TYPE_STRING,
+                          vmbsrc->camera.info.serialString != NULL ? vmbsrc->camera.info.serialString : "",
+                          "camera-name", G_TYPE_STRING,
+                          vmbsrc->properties.camera_name != NULL ? vmbsrc->properties.camera_name : "",
+                          "camera-index", G_TYPE_INT, (gint)vmbsrc->properties.camera_index,
                           NULL);
     }
 
@@ -1954,6 +2023,13 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
         payload->camera_frame_id = (guint64)frame->frameID;
         payload->camera_timestamp = (guint64)frame->timestamp;
         payload->correlated = correlated;
+        payload->camera_index = (gint)vmbsrc->properties.camera_index;
+        g_strlcpy(payload->camera_serial,
+                  vmbsrc->camera.info.serialString != NULL ? vmbsrc->camera.info.serialString : "",
+                  sizeof(payload->camera_serial));
+        g_strlcpy(payload->camera_name,
+                  vmbsrc->properties.camera_name != NULL ? vmbsrc->properties.camera_name : "",
+                  sizeof(payload->camera_name));
         NvDsMeta *nvds_meta = gst_buffer_add_nvds_meta(buffer, payload, NULL,
                                                        gst_vmbsrc_nvds_meta_copy,
                                                        gst_vmbsrc_nvds_meta_release);
@@ -2045,12 +2121,19 @@ gboolean gst_buffer_get_vmbsrc_trigger_meta(GstBuffer *buffer, GstVmbSrcTriggerM
     out->camera_frame_id = 0;
     out->camera_timestamp = 0;
     out->correlated = FALSE;
+    out->camera_serial = NULL;
+    out->camera_name = NULL;
+    out->camera_index = G_MAXINT;
     gst_structure_get_uint64(s, "trigger-seq", &out->trigger_seq);
     gst_structure_get_uint64(s, "trigger-time", &out->trigger_time);
     gst_structure_get_uint64(s, "approx-latency", &out->approx_latency);
     gst_structure_get_uint64(s, "camera-frame-id", &out->camera_frame_id);
     gst_structure_get_uint64(s, "camera-timestamp", &out->camera_timestamp);
     gst_structure_get_boolean(s, "correlated", &out->correlated);
+    // Strings are owned by the structure (valid while the buffer is alive); index defaults to G_MAXINT.
+    out->camera_serial = gst_structure_get_string(s, "camera-serial");
+    out->camera_name = gst_structure_get_string(s, "camera-name");
+    gst_structure_get_int(s, "camera-index", &out->camera_index);
     return TRUE;
 }
 

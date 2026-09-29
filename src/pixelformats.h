@@ -13,6 +13,13 @@
     "height = " GST_VIDEO_SIZE_RANGE ", " \
     "framerate = " GST_VIDEO_FPS_RANGE
 
+#define GST_BAYER_CAPS_MAKE_WITH_FEATURES(features, format) \
+    "video/x-bayer(" features "), "                          \
+    "format = (string) " format ", "                         \
+    "width = " GST_VIDEO_SIZE_RANGE ", "                     \
+    "height = " GST_VIDEO_SIZE_RANGE ", "                    \
+    "framerate = " GST_VIDEO_FPS_RANGE
+
 typedef struct
 {
     const char *vimbax_format_name;

@@ -261,6 +261,9 @@ struct _GstVmbSrc
     GstVideoInfo video_info;
 
     bool use_nvmm;
+    // TRUE if the negotiated caps are video/x-bayer. GstVideoInfo can not describe Bayer formats
+    // (format is ENCODED, stride 0), so layout-dependent code has to check this instead
+    bool is_bayer;
 
     // Hardware-trigger correlation state, fed via the "notify-trigger" action signal and consumed
     // in gst_vmbsrc_create. Access is serialized by lock because triggers are pushed from an

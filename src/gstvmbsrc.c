@@ -71,7 +71,8 @@ GST_DEBUG_CATEGORY_STATIC(gst_vmbsrc_debug_category);
 #if HAVE_NVMM
 
 #define GST_VMBSRC_CAPS_NVMM \
-    ";" GST_VIDEO_CAPS_MAKE_WITH_FEATURES(GST_CAPS_FEATURE_MEMORY_NVMM, "{ GRAY8, RGB, BGR, UYVY, BGRx, RGBA }")
+    ";" GST_VIDEO_CAPS_MAKE_WITH_FEATURES(GST_CAPS_FEATURE_MEMORY_NVMM, "{ GRAY8, RGB, BGR, UYVY, BGRx, RGBA }") \
+    ";" GST_BAYER_CAPS_MAKE_WITH_FEATURES(GST_CAPS_FEATURE_MEMORY_NVMM, GST_BAYER_FORMATS_ALL)
 #else
 #define GST_VMBSRC_CAPS_NVMM
 #endif
@@ -89,6 +90,12 @@ static GstCaps *gst_vmbsrc_get_caps(GstBaseSrc *src, GstCaps *filter);
 static gboolean gst_vmbsrc_set_caps(GstBaseSrc *src, GstCaps *caps);
 static gboolean gst_vmbsrc_start(GstBaseSrc *src);
 static gboolean gst_vmbsrc_stop(GstBaseSrc *src);
+#if HAVE_NVMM
+static gboolean get_nvmm_layout(GstVmbSrc *vmbsrc,
+                                GstVideoInfo *video_info,
+                                NvBufSurfaceColorFormat *color_format,
+                                uint32_t *stride);
+#endif
 
 static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf);
 
@@ -1317,36 +1324,6 @@ static GstCaps *gst_vmbsrc_get_caps(GstBaseSrc *src, GstCaps *filter)
 
         g_value_set_int(&height, (gint)vmb_height);
 
-        GstStructure *raw_caps = gst_caps_get_structure(caps, 0);
-        GstStructure *bayer_caps = gst_caps_get_structure(caps, 1);
-
-        gst_structure_set_value(raw_caps, "width", &width);
-        gst_structure_set_value(raw_caps, "height", &height);
-        gst_structure_set(raw_caps,
-                          // TODO: Check if framerate should also be gotten from camera (e.g. as max-framerate here)
-                          // Mark the framerate as variable because triggering might cause variable framerate
-                          "framerate", GST_TYPE_FRACTION, 0, 1,
-                          NULL);
-
-        gst_structure_set_value(bayer_caps, "width", &width);
-        gst_structure_set_value(bayer_caps, "height", &height);
-        gst_structure_set(bayer_caps,
-                          // TODO: Check if framerate should also be gotten from camera (e.g. as max-framerate here)
-                          // Mark the framerate as variable because triggering might cause variable framerate
-                          "framerate", GST_TYPE_FRACTION, 0, 1,
-                          NULL);
-#if HAVE_NVMM
-        GstStructure *nvmm_raw_caps = gst_caps_get_structure(caps, 2);
-
-        gst_structure_set_value(nvmm_raw_caps, "width", &width);
-        gst_structure_set_value(nvmm_raw_caps, "height", &height);
-        gst_structure_set(nvmm_raw_caps,
-                          // TODO: Check if framerate should also be gotten from camera (e.g. as max-framerate here)
-                          // Mark the framerate as variable because triggering might cause variable framerate
-                          "framerate", GST_TYPE_FRACTION, 0, 1,
-                          NULL);
-#endif 
-
         // Query supported pixel formats from camera and map them to GStreamer formats
         GValue pixel_format_raw_list = G_VALUE_INIT;
         g_value_init(&pixel_format_raw_list, GST_TYPE_LIST);
@@ -1371,8 +1348,39 @@ static GstCaps *gst_vmbsrc_get_caps(GstBaseSrc *src, GstCaps *filter)
                 gst_value_list_append_value(&pixel_format_raw_list, &pixel_format);
             }
         }
-        gst_structure_set_value(raw_caps, "format", &pixel_format_raw_list);
-        gst_structure_set_value(bayer_caps, "format", &pixel_format_bayer_list);
+
+        // Structures are identified by name and memory feature instead of by their index in the
+        // template caps, as the number of structures differs depending on HAVE_NVMM
+        for (guint i = 0; i < gst_caps_get_size(caps); i++)
+        {
+            GstStructure *structure = gst_caps_get_structure(caps, i);
+            gboolean is_nvmm = gst_caps_features_contains(gst_caps_get_features(caps, i),
+                                                          GST_CAPS_FEATURE_MEMORY_NVMM);
+
+            gst_structure_set_value(structure, "width", &width);
+            gst_structure_set_value(structure, "height", &height);
+            gst_structure_set(structure,
+                              // TODO: Check if framerate should also be gotten from camera (e.g. as max-framerate here)
+                              // Mark the framerate as variable because triggering might cause variable framerate
+                              "framerate", GST_TYPE_FRACTION, 0, 1,
+                              NULL);
+
+            if (gst_structure_has_name(structure, "video/x-bayer"))
+            {
+                // Only 8 bit Bayer formats are mapped, so the camera list is valid for NVMM as well
+                gst_structure_set_value(structure, "format", &pixel_format_bayer_list);
+            }
+            else if (!is_nvmm)
+            {
+                gst_structure_set_value(structure, "format", &pixel_format_raw_list);
+            }
+            // NVMM raw caps keep the format list of the template as only those formats can be
+            // allocated as NvBufSurface
+        }
+
+        g_value_unset(&pixel_format);
+        g_value_unset(&pixel_format_raw_list);
+        g_value_unset(&pixel_format_bayer_list);
     }
 
     GST_DEBUG_OBJECT(vmbsrc, "returning caps: %s", gst_caps_to_string(caps));
@@ -1395,6 +1403,7 @@ static gboolean gst_vmbsrc_set_caps(GstBaseSrc *src, GstCaps *caps)
     GstStructure *structure;
     structure = gst_caps_get_structure(caps, 0);
     const char *gst_format = gst_structure_get_string(structure, "format");
+    vmbsrc->is_bayer = gst_structure_has_name(structure, "video/x-bayer");
     GST_DEBUG_OBJECT(vmbsrc,
                      "Looking for matching VimbaX pixel format to GSreamer format \"%s\"",
                      gst_format);
@@ -1461,6 +1470,20 @@ static gboolean gst_vmbsrc_set_caps(GstBaseSrc *src, GstCaps *caps)
         return FALSE;
     }
 
+#if HAVE_NVMM
+    if (vmbsrc->use_nvmm)
+    {
+        // Fail negotiation here instead of later during buffer allocation
+        NvBufSurfaceColorFormat color_format;
+        uint32_t stride;
+        if (!get_nvmm_layout(vmbsrc, &video_info, &color_format, &stride))
+        {
+            GST_ERROR_OBJECT(vmbsrc, "Format \"%s\" can not be provided in NVMM memory", gst_format);
+            return FALSE;
+        }
+    }
+#endif
+
 
     // width and height are always the value that is already written on the camera because get_caps only reports that
     // value. Setting it here is not necessary as the feature values are controlled via properties of the element.
@@ -1519,6 +1542,7 @@ static gboolean gst_vmbsrc_start(GstBaseSrc *src)
     }
 
     vmbsrc->use_nvmm = false;
+    vmbsrc->is_bayer = false;
 
     VmbError_t result;
 
@@ -1955,24 +1979,29 @@ static GstFlowReturn gst_vmbsrc_create(GstPushSrc *src, GstBuffer **buf)
     // conventional for raw video.
     GST_BUFFER_DURATION(buffer) = GST_CLOCK_TIME_NONE;
 
-    // Manually calculate the stride for pixel rows as it might not be identical to GStreamer
-    // expectations
-    gint stride[GST_VIDEO_MAX_PLANES] = {0};
-    gint num_planes = vmbsrc->video_info.finfo->n_planes;
-
-    for (gint i = 0; i < num_planes; ++i)
+    // GstVideoInfo can not describe Bayer formats (format ENCODED, stride 0), so a video meta would
+    // carry invalid strides. Only attach it for formats GstVideoInfo can describe.
+    if (GST_VIDEO_INFO_FORMAT(&vmbsrc->video_info) != GST_VIDEO_FORMAT_ENCODED)
     {
-        stride[i] = vmbsrc->video_info.width * vmbsrc->video_info.finfo->pixel_stride[i];
-    }
+        // Manually calculate the stride for pixel rows as it might not be identical to GStreamer
+        // expectations
+        gint stride[GST_VIDEO_MAX_PLANES] = {0};
+        gint num_planes = vmbsrc->video_info.finfo->n_planes;
 
-    gst_buffer_add_video_meta_full(buffer,
-                                   GST_VIDEO_FRAME_FLAG_NONE,
-                                   vmbsrc->video_info.finfo->format,
-                                   vmbsrc->video_info.width,
-                                   vmbsrc->video_info.height,
-                                   num_planes,
-                                   vmbsrc->video_info.offset,
-                                   stride);
+        for (gint i = 0; i < num_planes; ++i)
+        {
+            stride[i] = vmbsrc->video_info.width * vmbsrc->video_info.finfo->pixel_stride[i];
+        }
+
+        gst_buffer_add_video_meta_full(buffer,
+                                       GST_VIDEO_FRAME_FLAG_NONE,
+                                       vmbsrc->video_info.finfo->format,
+                                       vmbsrc->video_info.width,
+                                       vmbsrc->video_info.height,
+                                       num_planes,
+                                       vmbsrc->video_info.offset,
+                                       stride);
+    }
 
     GST_BUFFER_OFFSET(buffer) = vmbsrc->num_frames_pushed;
     GST_BUFFER_OFFSET_END(buffer) = ++(vmbsrc->num_frames_pushed);
@@ -2881,29 +2910,57 @@ VmbError_t apply_trigger_settings(GstVmbSrc *vmbsrc)
 }
 
 #if HAVE_NVMM
-static NvBufSurfaceColorFormat get_nvmm_format(GstVideoInfo *video_info)
+/**
+ * @brief Determines the NvBufSurface color format and the row stride in bytes of the negotiated format
+ *
+ * GstVideoInfo can not describe Bayer formats (format is ENCODED and stride is 0). 8 bit Bayer data has
+ * the same memory layout as GRAY8 (one plane, one byte per pixel), so it is allocated as a GRAY8 surface.
+ * The Bayer pattern itself is carried by the negotiated caps.
+ *
+ * @return gboolean FALSE if the format can not be allocated as NvBufSurface
+ */
+static gboolean get_nvmm_layout(GstVmbSrc *vmbsrc,
+                                GstVideoInfo *video_info,
+                                NvBufSurfaceColorFormat *color_format,
+                                uint32_t *stride)
 {
+    if (vmbsrc->is_bayer)
+    {
+        *color_format = NVBUF_COLOR_FORMAT_GRAY8;
+        *stride = (uint32_t)GST_VIDEO_INFO_WIDTH(video_info);
+        return TRUE;
+    }
+
     int video_fmt = GST_VIDEO_INFO_FORMAT(video_info);
     switch (video_fmt)
     {
     case GST_VIDEO_FORMAT_GRAY8:
-        return NVBUF_COLOR_FORMAT_GRAY8;
+        *color_format = NVBUF_COLOR_FORMAT_GRAY8;
+        break;
     case GST_VIDEO_FORMAT_UYVY:
-        return NVBUF_COLOR_FORMAT_UYVY;  
+        *color_format = NVBUF_COLOR_FORMAT_UYVY;
+        break;
     case GST_VIDEO_FORMAT_YUY2:
-        return NVBUF_COLOR_FORMAT_YUYV;
+        *color_format = NVBUF_COLOR_FORMAT_YUYV;
+        break;
     case GST_VIDEO_FORMAT_RGB:
-        return NVBUF_COLOR_FORMAT_RGB;
+        *color_format = NVBUF_COLOR_FORMAT_RGB;
+        break;
     case GST_VIDEO_FORMAT_BGR:
-        return NVBUF_COLOR_FORMAT_BGR;
+        *color_format = NVBUF_COLOR_FORMAT_BGR;
+        break;
     case GST_VIDEO_FORMAT_BGRx:
-        return NVBUF_COLOR_FORMAT_BGRx;
+        *color_format = NVBUF_COLOR_FORMAT_BGRx;
+        break;
     case GST_VIDEO_FORMAT_RGBA:
-        return NVBUF_COLOR_FORMAT_RGBA;
+        *color_format = NVBUF_COLOR_FORMAT_RGBA;
+        break;
     default:
-        GST_ERROR("Format %d not supported", video_fmt);
-        return NVBUF_COLOR_FORMAT_INVALID;
+        GST_ERROR_OBJECT(vmbsrc, "Format %d not supported", video_fmt);
+        return FALSE;
     }
+    *stride = (uint32_t)GST_VIDEO_INFO_PLANE_STRIDE(video_info, 0);
+    return TRUE;
 }
 
 static uint32_t align_to(uint32_t value, uint32_t alignment)
@@ -2944,7 +3001,15 @@ VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc, GstVideoInfo *video_inf
                  *   the height used for allocation is adjusted. Once the image is received completly
                  *   the height in overriden with the actual value.
                  */
-                const uint32_t pitch = align_to(GST_VIDEO_INFO_PLANE_STRIDE(video_info, 0), 256);
+                NvBufSurfaceColorFormat color_format;
+                uint32_t stride;
+                if (!get_nvmm_layout(vmbsrc, video_info, &color_format, &stride))
+                {
+                    result = VmbErrorBadParameter;
+                    break;
+                }
+
+                const uint32_t pitch = align_to(stride, 256);
                 const uint32_t aligned_payload_size = align_to(payload_size, 4096);
                 const uint32_t buffer_height = aligned_payload_size / pitch;
 
@@ -2956,7 +3021,7 @@ VmbError_t alloc_and_announce_buffers(GstVmbSrc *vmbsrc, GstVideoInfo *video_inf
                 paramsext.params.width = GST_VIDEO_INFO_WIDTH(video_info);
                 paramsext.params.height = buffer_height;
                 paramsext.params.size = payload_size; 
-                paramsext.params.colorFormat = get_nvmm_format(video_info); 
+                paramsext.params.colorFormat = color_format;
                 paramsext.params.layout = NVBUF_LAYOUT_PITCH;
                 paramsext.params.memType = NVBUF_MEM_SURFACE_ARRAY;
                 paramsext.memtag = NvBufSurfaceTag_CAMERA;

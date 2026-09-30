@@ -2,6 +2,7 @@
 The official plugin laks some features which makes it not really usable in production environments. These features are added in this fork:
 - Loading of user presets. Now it is posible to load user presets by userset=UserSet1. In this case all other parameters will be ignored (except camera parameter). So it is possible to load a glean state.
 - No implicit setting of parameters. The official verseion sets implicitly some parameters, even if they aren't given. This may lead to unwanted effects if one does not set them to the desired values. Especially for loading UserSets this is unfavorible. Additionally it is now possible to set a default UserSet in the camera which the camera loads at startup. This will now survive when using just the camera parameter.
+- 8 bit Bayer formats in NVMM memory (`video/x-bayer(memory:NVMM)`) on NVIDIA Jetson. The camera writes the raw Bayer data directly into NVMM buffers, so it can be debayered on the GPU without any CPU copy. See [NVMM memory formats](#nvmm-memory-formats-nvidia-jetson).
 - Small fixes for the parameter handling, which were a result of copy and paste, but not changing al variable names to the right name.
 
 ## Warning
@@ -232,6 +233,41 @@ is able to debayer the data into a widely accepted RGBA format.
 | BayerGB8            | gbrg                           |
 | BayerBG8            | bggr                           |
 
+#### NVMM memory formats (NVIDIA Jetson)
+If `vmbsrc` was built with NVMM support (see [Building](#building)), image data can be written
+directly into NVMM buffers (`NvBufSurface`) by adding the `memory:NVMM` feature to the capsfilter.
+The following formats are available in NVMM memory:
+
+| Caps                         | Formats                          | NvBufSurface color format |
+|------------------------------|----------------------------------|---------------------------|
+| `video/x-raw(memory:NVMM)`   | GRAY8, RGB, BGR, UYVY, BGRx, RGBA | matching format           |
+| `video/x-bayer(memory:NVMM)` | rggb, grbg, gbrg, bggr (8 bit)   | GRAY8                     |
+
+Example pipeline that records BayerRG8 into NVMM buffers:
+```
+gst-launch-1.0 vmbsrc camera=DEV_1AB22D01BBB8 userset=UserSet1 ! 'video/x-bayer(memory:NVMM),format=rggb' ! ...
+```
+
+Things to consider when using Bayer in NVMM memory:
+- `NvBufSurface` has no Bayer color format. 8 bit Bayer data has the same memory layout as GRAY8 (one
+  plane, one byte per pixel), so the buffers are allocated as GRAY8 surfaces. **The Bayer pattern is
+  only carried by the negotiated caps** (`format=rggb` etc.). The element following `vmbsrc` has to
+  take the pattern from the caps, not from the surface color format.
+- NVIDIA elements such as `nvvideoconvert` or `nvstreammux` do not accept `video/x-bayer` caps. A
+  debayer element that reads Bayer from NVMM and outputs e.g. `video/x-raw(memory:NVMM),format=RGBA`
+  has to be placed directly after `vmbsrc`. Such an element is not part of this plugin.
+- **The image width has to fit the row alignment of the Jetson surfaces.** The camera writes the image
+  rows without padding, but the NVMM surface rows are aligned (256 bytes on Jetson Orin). If the
+  width does not fit, the pipeline stops with `not-negotiated` and the message
+  `width pitch missmatch detected got: <width>, required: <aligned width>`. For 8 bit formats choose a
+  width that is a multiple of 256 (e.g. 2304 instead of the full 2464 of an Alvium GM2-510c), either
+  in the user set or via the `width` property.
+- Only 8 bit Bayer formats are supported. No `GstVideoMeta` is attached to Bayer buffers, as
+  `GstVideoInfo` can not describe Bayer formats. Other metadata (trigger meta, reference timestamp,
+  DeepStream meta) is attached as usual.
+- Always give an explicit `format=` in the capsfilter, so the pixel format of the camera is set as
+  intended (see [Supported pixel formats](#supported-pixel-formats)).
+
 ## Troubleshooting
 - The `vmbsrc` element is not loadable
   - Ensure that the installation of the plugin was successful and that all required dependencies are
@@ -271,6 +307,11 @@ is able to debayer the data into a widely accepted RGBA format.
 - The `videoconvert` element complains about too small buffer size
   - This is most likely caused by the width of the image data not being evenly divisible by 4 as the
     `videoconvert` element expects. Try setting the width to a value that is evenly divisible by 4.
+
+- The pipeline stops with `not-negotiated` and `width pitch missmatch detected` when using NVMM
+  memory
+  - The image width does not fit the row alignment of the NVMM surfaces. See [NVMM memory
+    formats](#nvmm-memory-formats-nvidia-jetson).
 
 ## Known issues and limitations
 - In situations where cameras submit many frames per second, visualization may slow down the

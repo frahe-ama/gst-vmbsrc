@@ -32,6 +32,8 @@ queried with `gst-inspect-1.0 vmbsrc`; the table below is a quick reference.
 | `triggerlatency`        | uint64 | `0`        | Nominal trigger→arrival latency in microseconds, used to correlate frames with external trigger events. `0` = estimate from data. See [Correlating frames with an external hardware trigger](#correlating-frames-with-an-external-hardware-trigger) |
 | `triggerlatencytolerance`| uint64| `0`        | Acceptance half-window in microseconds for a trigger match. `0` = always accept the nearest trigger    |
 | `triggerlatencymeta`    | bool   | `true`     | Attach a `GstReferenceTimestampMeta` anchoring DeepStream latency at the trigger instant (frame arrival time for frames without a correlated trigger) — see [DeepStream latency anchored at the trigger](#deepstream-latency-anchored-at-the-trigger) |
+| `cameraname`            | string | `""`       | Application-defined camera name, carried unchanged in the frame metadata (`camera-name` in `GstVmbSrcTriggerMeta` and the DeepStream payload). Independent of the camera's own name. Truncated to 63 characters in the DeepStream payload |
+| `cameraindex`           | int    | `G_MAXINT` | Application-defined camera index (e.g. the `nvstreammux` source id), carried unchanged in the frame metadata (`camera-index`). Any int value is valid; `G_MAXINT` = unset |
 
 Since `triggerselector`, `triggermode`, `triggersource` and `triggeractivation` each default to
 `UNCHANGED`, setting up a trigger requires passing all of them together, e.g.
@@ -289,6 +291,16 @@ frame uncorrelated when no trigger falls within the window.
   a form `nvstreammux` copies onto `NvDsFrameMeta` without a probe. String fields are fixed-capacity
   (`char[64]`) so the payload stays a flat POD; see [Bridging the meta into DeepStream frame
   metadata](#bridging-the-meta-into-deepstream-frame-metadata).
+
+`camera-name` and `camera-index` are not read from the camera but set by the application via the
+`cameraname` and `cameraindex` properties. This lets a consumer identify the source of a frame
+without knowing the serial numbers, e.g. with several cameras feeding one `nvstreammux`:
+```
+gst-launch-1.0 \
+  vmbsrc camera=DEV_00012C0B5D0C cameraname=left  cameraindex=0 ! ... ! mux.sink_0 \
+  vmbsrc camera=DEV_00012C0B5D0D cameraname=right cameraindex=1 ! ... ! mux.sink_1 \
+  nvstreammux name=mux ... ! ...
+```
 
 ### Buffer PTS: trigger vs. no-trigger cases
 
